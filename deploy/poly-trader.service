@@ -7,7 +7,8 @@ Wants=network-online.target
 Type=simple
 User=dotanwork
 WorkingDirectory=/home/dotanwork/poly-trader
-ExecStart=/usr/bin/python3 /home/dotanwork/poly-trader/main.py --mode paper
+ExecStart=/usr/bin/python3 /home/dotanwork/poly-trader/main.py --mode live --yes
+Environment=TRADING_MODE=live
 Restart=always
 RestartSec=5
 StandardOutput=journal

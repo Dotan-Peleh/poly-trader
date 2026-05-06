@@ -156,16 +156,30 @@ def main():
     parser = argparse.ArgumentParser(description="poly-trader bot")
     parser.add_argument("--mode", choices=["paper", "live"], default="paper")
     parser.add_argument("--capital", type=float, default=settings.starting_capital)
+    parser.add_argument("--yes", action="store_true",
+                         help="Auto-accept LIVE mode confirmation (for systemd)")
     args = parser.parse_args()
 
     if args.mode == "live":
+        # Safety check — refuse to start live unless all 5 secrets resolve
+        from execution.polymarket_orders import live_readiness_check
+        ready, missing = live_readiness_check()
+        if not ready:
+            print(f"\n❌ Cannot start LIVE: missing secrets {missing}")
+            return
         print("\n" + "=" * 60)
         print("WARNING: LIVE MODE — real USDC will be traded on Polymarket")
         print("Polygon wallet must have USDC and gas. Trade-only signing key.")
+        print(f"Funder: {settings.polymarket_funder_address}")
+        print(f"Per-trade cap: $5 (first 24h)  |  Daily loss halt: -$10")
         print("=" * 60)
-        confirm = input("Type exactly 'yes i understand the risk' to proceed: ")
-        if confirm.strip() != "yes i understand the risk":
-            print("Aborted."); return
+        if not args.yes:
+            confirm = input("Type exactly 'yes i understand the risk' to proceed: ")
+            if confirm.strip() != "yes i understand the risk":
+                print("Aborted.")
+                return
+        else:
+            logger.warning("LIVE mode auto-confirmed via --yes flag")
 
     init_db()
     notifier = Notifier()

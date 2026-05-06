@@ -83,11 +83,67 @@ def reference_backfill_tick():
         logger.error(f"reference_backfill failed: {e}")
 
 
-def decision_tick():
-    """Phase 2 will populate this. For now just logs that it fired."""
+def decision_tick(notifier: Notifier):
+    """Phase 2: sweep markets in firing window, run pricer + Claude gate,
+    record paper trades."""
     if is_halted():
         return
-    logger.debug("decision_tick: (not implemented yet — Phase 2)")
+    try:
+        from strategies.late_window import decision_tick_impl
+        from claude_decision.decision import claude_gate
+        n = decision_tick_impl(notifier=notifier, claude_gate=claude_gate)
+        if n:
+            logger.info(f"decision_tick: fired {n} paper trade(s)")
+    except Exception as e:
+        logger.error(f"decision_tick failed: {e}")
+
+
+def settle_tick(notifier: Notifier):
+    """Settle resolved paper trades — runs every minute. Pings Telegram on
+    each settlement so user sees outcomes in real time."""
+    if is_halted():
+        return
+    try:
+        from strategies.late_window import settle_resolved_markets
+        from execution.wallet import Wallet
+        from sqlalchemy.orm import Session
+        from data.storage import engine, Decision
+
+        # Find unresolved decisions whose markets have closed before settling
+        # (so we can capture and ping the actual P&L)
+        before_ids = set()
+        with Session(engine) as session:
+            for d in session.query(Decision).filter(
+                Decision.mode == settings.trading_mode,
+                Decision.resolution_yes.is_(None),
+            ).all():
+                before_ids.add(d.id)
+
+        n = settle_resolved_markets()
+        if n == 0:
+            return
+
+        # Re-query to find which decisions just resolved
+        with Session(engine) as session:
+            newly_resolved = session.query(Decision).filter(
+                Decision.id.in_(before_ids),
+                Decision.resolution_yes.isnot(None),
+            ).all()
+            for d in newly_resolved:
+                won = bool(d.pnl_usd is not None and d.pnl_usd > 0)
+                icon = "🎯" if won else "🔴"
+                tag = "WIN" if won else "LOSS"
+                notifier.send(
+                    f"{icon} <b>{tag}</b> <code>{d.condition_id}</code>\n"
+                    f"📊 {d.side} @ {d.paid_per_unit*100:.0f}¢ | "
+                    f"size=${d.size_usd:.2f}\n"
+                    f"💸 P&amp;L: <b>${d.pnl_usd:+,.2f}</b>\n"
+                    f"💡 model={d.model_yes_prob*100:.1f}% vs implied={d.implied_yes_prob*100:.1f}%, "
+                    f"resolution_yes={d.resolution_yes}"
+                )
+        logger.info(f"settle_tick: {n} decisions settled")
+    except Exception as e:
+        logger.error(f"settle_tick failed: {e}")
 
 
 def main():
@@ -121,7 +177,9 @@ def main():
     scheduler.add_job(reference_backfill_tick, "interval", minutes=5,
                        id="reference_backfill")
     scheduler.add_job(decision_tick, "interval", seconds=5,
-                       id="decision_tick")
+                       args=[notifier], id="decision_tick")
+    scheduler.add_job(settle_tick, "interval", seconds=60,
+                       args=[notifier], id="settle_tick")
     scheduler.add_job(write_heartbeat, "interval", minutes=5,
                        id="heartbeat")
     scheduler.start()

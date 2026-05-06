@@ -89,6 +89,20 @@ def reference_backfill_tick():
         logger.error(f"reference_backfill failed: {e}")
 
 
+def wallet_snapshot_tick():
+    """Pull live Polymarket wallet state (balance + positions + recent trades)
+    and upload a JSON snapshot to GCS for the dashboard. Live-mode only."""
+    if is_halted():
+        return
+    if settings.trading_mode != "live":
+        return
+    try:
+        from data.polymarket_wallet import write_wallet_snapshot
+        write_wallet_snapshot()
+    except Exception as e:
+        logger.error(f"wallet_snapshot_tick failed: {e}")
+
+
 def decision_tick(notifier: Notifier):
     """Phase 2: sweep markets in firing window, run pricer + Claude gate,
     record paper trades."""
@@ -202,6 +216,8 @@ def main():
                        args=[notifier], id="settle_tick")
     scheduler.add_job(write_heartbeat, "interval", minutes=5,
                        id="heartbeat")
+    scheduler.add_job(wallet_snapshot_tick, "interval", minutes=2,
+                       id="wallet_snapshot")
     scheduler.start()
     logger.info("Scheduler started")
 

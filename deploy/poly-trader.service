@@ -1,0 +1,18 @@
+[Unit]
+Description=Poly Trader Bot (Kalshi KXBTC15M)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dotanwork
+WorkingDirectory=/home/dotanwork/poly-trader
+ExecStart=/usr/bin/python3 /home/dotanwork/poly-trader/main.py --mode paper
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

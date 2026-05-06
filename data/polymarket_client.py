@@ -1,25 +1,22 @@
 """
-Polymarket CLOB client — read-only for Phase 1.
+Polymarket client — Gamma API for discovery, CLOB for books + orders.
 
-Polymarket's CLOB API surfaces:
-  - GET /markets                — list of markets (paginated)
-  - GET /markets/{condition_id} — market detail
-  - GET /book?token_id=...      — order book for a YES or NO token
-  - GET /price?token_id=...     — last trade price
+Target product: 5-min BTC up/down events.
+  Title pattern: "Bitcoin Up or Down - <Month> <Day>, <H:MM>AM/PM-<H:MM>AM/PM ET"
+  Each event resolves on whether BTC at the END timestamp is higher than
+  at the START timestamp (using a published Coinbase index).
 
-Hourly BTC binaries follow the pattern:
-  question = "Bitcoin Up or Down on YYYY-MM-DD HH:MM ET?"
-  resolution_ts ≈ next hour boundary in NY time
+Read endpoints (free, no auth):
+  GET https://gamma-api.polymarket.com/events?closed=false&order=startDate&ascending=false
+  GET https://clob.polymarket.com/book?token_id=...
 
-We filter to BTC up/down hourly markets only and store the active set
-in the polymarket_markets table.
-
-Phase 5 will add order placement (requires Polygon EOA signing). Phase 1-4
-is read-only.
+Write endpoints (live only — Phase 5, requires HMAC creds):
+  POST https://clob.polymarket.com/orders
+  Order signing handled by py-clob-client when settings.trading_mode == 'live'.
 """
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
@@ -30,91 +27,133 @@ from data.storage import upsert_market, save_book_snapshot
 logger = logging.getLogger(__name__)
 
 
-# Match: "Bitcoin Up or Down on Tuesday May 6, 9 PM ET?"  or  "...3 AM ET?"
-BTC_HOURLY_PATTERN = re.compile(
-    r"\bbitcoin\b.*\b(up|down|above|below)\b.*\bET\b",
+GAMMA_BASE = "https://gamma-api.polymarket.com"
+CLOB_BASE = "https://clob.polymarket.com"
+
+# Match: "Bitcoin Up or Down - May 7, 3:55PM-4:00PM ET"
+# Capture: month_day, start_time, end_time
+TITLE_RE = re.compile(
+    r"Bitcoin Up or Down - "
+    r"(?P<month>\w+) (?P<day>\d+), "
+    r"(?P<start_h>\d+)(?::(?P<start_m>\d+))?(?P<start_ap>AM|PM)"
+    r"-"
+    r"(?P<end_h>\d+)(?::(?P<end_m>\d+))?(?P<end_ap>AM|PM)\s*ET",
     re.IGNORECASE,
 )
 
 
-def _client() -> httpx.Client:
-    return httpx.Client(
-        base_url=settings.polymarket_clob_base,
-        timeout=httpx.Timeout(10.0, read=20.0),
-        headers={"User-Agent": "poly-trader/0.1"},
-    )
+def _gamma_client() -> httpx.Client:
+    return httpx.Client(base_url=GAMMA_BASE,
+                          timeout=httpx.Timeout(15.0, read=30.0),
+                          headers={"User-Agent": "poly-trader/0.2"})
 
 
-def list_active_markets() -> list[dict]:
-    """Pull active markets, filter to BTC hourly binaries.
+def _clob_client() -> httpx.Client:
+    return httpx.Client(base_url=CLOB_BASE,
+                          timeout=httpx.Timeout(10.0, read=20.0),
+                          headers={"User-Agent": "poly-trader/0.2"})
 
-    Returns a list of dicts with: condition_id, question, end_date_iso,
-    yes_token_id, no_token_id."""
+
+def list_btc_events(window_minutes: int = 5, limit: int = 500) -> list[dict]:
+    """Pull active BTC up/down events of a given window length.
+
+    window_minutes: 5, 15, 60, 240, etc. We filter by computing the
+    duration from the event title's start/end times.
+    """
     out: list[dict] = []
     try:
-        with _client() as c:
-            # Polymarket pages results; pull first 500 (more than enough for
-            # active markets in any single moment).
-            resp = c.get("/markets?active=true&closed=false&limit=500")
-            resp.raise_for_status()
-            data = resp.json()
-            markets = data.get("data") if isinstance(data, dict) else data
-            if not isinstance(markets, list):
-                logger.warning(f"unexpected markets payload type: {type(markets)}")
+        with _gamma_client() as c:
+            r = c.get(f"/events?closed=false&order=startDate&ascending=false&limit={limit}")
+            r.raise_for_status()
+            events = r.json()
+            if not isinstance(events, list):
                 return []
-            for m in markets:
-                question = m.get("question") or m.get("title") or ""
-                if not BTC_HOURLY_PATTERN.search(question):
+            for e in events:
+                title = e.get("title") or ""
+                m = TITLE_RE.search(title)
+                if not m:
                     continue
-                # Pull token ids — varies by API version
-                tokens = m.get("tokens") or []
-                yes_token = no_token = None
-                for t in tokens:
-                    outcome = (t.get("outcome") or "").upper()
-                    tok = t.get("token_id") or t.get("id")
-                    if outcome in ("YES", "UP", "ABOVE"):
-                        yes_token = tok
-                    elif outcome in ("NO", "DOWN", "BELOW"):
-                        no_token = tok
-                end_iso = (
-                    m.get("end_date_iso")
-                    or m.get("endDate")
-                    or m.get("end_date")
-                )
-                cid = m.get("condition_id") or m.get("conditionId") or m.get("id")
-                if not (cid and end_iso):
+                try:
+                    duration = _parse_duration_min(m)
+                except Exception:
                     continue
-                out.append({
-                    "condition_id": cid,
-                    "question": question,
-                    "end_date_iso": end_iso,
-                    "yes_token_id": yes_token,
-                    "no_token_id": no_token,
-                })
-    except Exception as e:
-        logger.warning(f"list_active_markets failed: {e}")
+                if duration != window_minutes:
+                    continue
+                out.append(e)
+    except Exception as ex:
+        logger.warning(f"list_btc_events failed: {ex}")
     return out
 
 
-def fetch_book(token_id: str) -> Optional[dict]:
-    """Order book for a single YES or NO token.
+def _parse_duration_min(m) -> int:
+    """Compute window duration in minutes from regex match groups."""
+    def _to_min(h, mn, ap):
+        h = int(h)
+        mn = int(mn or 0)
+        if ap.upper() == "PM" and h != 12:
+            h += 12
+        if ap.upper() == "AM" and h == 12:
+            h = 0
+        return h * 60 + mn
+    start = _to_min(m.group("start_h"), m.group("start_m"), m.group("start_ap"))
+    end = _to_min(m.group("end_h"), m.group("end_m"), m.group("end_ap"))
+    if end < start:
+        end += 24 * 60   # crosses midnight
+    return end - start
 
-    Returns: { 'bids': [[price, size], ...], 'asks': [[price, size], ...] }
-    or None if unavailable."""
+
+def event_resolution_ts(event: dict) -> Optional[datetime]:
+    """Pull the resolution timestamp from the event's endDate."""
+    try:
+        s = (event.get("endDate") or "").replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def event_yes_no_token_ids(event: dict) -> tuple[Optional[str], Optional[str]]:
+    """Extract YES + NO CLOB token IDs from an event's markets."""
+    markets = event.get("markets") or []
+    if not markets:
+        return None, None
+    m0 = markets[0]
+    # Polymarket events sometimes embed clobTokenIds as JSON string
+    raw = m0.get("clobTokenIds") or m0.get("clob_token_ids")
+    if isinstance(raw, str):
+        try:
+            import json as _json
+            raw = _json.loads(raw)
+        except Exception:
+            raw = None
+    if isinstance(raw, list) and len(raw) >= 2:
+        return str(raw[0]), str(raw[1])
+    # Fallback to outcome list
+    outcomes = m0.get("outcomes") or []
+    if len(outcomes) >= 2:
+        return str(outcomes[0]), str(outcomes[1])
+    return None, None
+
+
+def fetch_book(token_id: str) -> Optional[dict]:
+    """Fetch CLOB order book for a single token. Returns:
+      { 'bids': [{'price': '0.55', 'size': '100'}, ...], 'asks': [...] }
+    """
     if not token_id:
         return None
     try:
-        with _client() as c:
-            resp = c.get(f"/book?token_id={token_id}")
-            resp.raise_for_status()
-            return resp.json()
+        with _clob_client() as c:
+            r = c.get(f"/book?token_id={token_id}")
+            r.raise_for_status()
+            return r.json()
     except Exception as e:
-        logger.debug(f"fetch_book({token_id}) failed: {e}")
+        logger.debug(f"fetch_book({token_id[:20]}...) failed: {e}")
         return None
 
 
 def book_top(book: Optional[dict]) -> tuple[Optional[float], Optional[float], float]:
-    """Return (best_bid, best_ask, top5_depth_usd) from a CLOB book."""
+    """(best_bid, best_ask, depth_usd_top5) from a CLOB book.
+    Polymarket returns prices in [0, 1] (decimal probability)."""
     if not book:
         return None, None, 0.0
     bids = book.get("bids") or []
@@ -122,72 +161,63 @@ def book_top(book: Optional[dict]) -> tuple[Optional[float], Optional[float], fl
 
     def _row(r):
         if isinstance(r, dict):
-            return float(r.get("price")), float(r.get("size", 0))
+            return float(r.get("price", 0)), float(r.get("size", 0))
         return float(r[0]), float(r[1]) if len(r) > 1 else 0.0
 
-    bb = _row(bids[0])[0] if bids else None
-    ba = _row(asks[0])[0] if asks else None
-
+    best_bid = _row(bids[0])[0] if bids else None
+    best_ask = _row(asks[0])[0] if asks else None
     depth = 0.0
     for r in bids[:5] + asks[:5]:
         p, s = _row(r)
         depth += p * s
-    return bb, ba, round(depth, 2)
+    return best_bid, best_ask, round(depth, 2)
 
 
 def snapshot_market(condition_id: str, yes_token: str, no_token: str,
                      btc_price_now: Optional[float] = None) -> Optional[dict]:
-    """Pull both YES and NO order books, save a snapshot row, return summary."""
+    """Pull both YES + NO order books, persist a snapshot row."""
     yes_book = fetch_book(yes_token)
     no_book = fetch_book(no_token)
     yes_bid, yes_ask, yes_depth = book_top(yes_book)
     no_bid, no_ask, no_depth = book_top(no_book)
-    total_depth = yes_depth + no_depth
 
     save_book_snapshot(
         condition_id=condition_id,
         yes_bid=yes_bid, yes_ask=yes_ask,
         no_bid=no_bid, no_ask=no_ask,
-        book_depth_usd=total_depth,
+        book_depth_usd=yes_depth + no_depth,
         btc_price_at_snap=btc_price_now,
     )
-
     yes_mid = (yes_bid + yes_ask) / 2 if (yes_bid and yes_ask) else None
     return {
         "condition_id": condition_id,
         "yes_bid": yes_bid, "yes_ask": yes_ask, "yes_mid": yes_mid,
-        "no_bid": no_bid, "no_ask": no_ask,
-        "book_depth_usd": total_depth,
+        "yes_depth_usd": yes_depth, "no_depth_usd": no_depth,
     }
 
 
-def parse_resolution_ts(end_date_iso: str) -> Optional[datetime]:
-    """Convert Polymarket's end_date_iso into a UTC datetime."""
-    try:
-        # Common formats: '2026-05-06T22:00:00Z', '2026-05-06T22:00:00.000Z'
-        s = end_date_iso.rstrip("Z")
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is not None:
-            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-        return dt
-    except Exception:
-        return None
-
-
-def refresh_markets() -> int:
-    """Pull active BTC hourly markets, upsert to DB. Returns count saved."""
-    markets = list_active_markets()
+def refresh_markets(window_minutes: int = 5) -> int:
+    """Pull active BTC up/down events of given window, upsert into DB."""
+    events = list_btc_events(window_minutes=window_minutes)
     saved = 0
-    for m in markets:
-        rt = parse_resolution_ts(m["end_date_iso"])
-        if rt is None:
+    now = datetime.utcnow()
+    for e in events:
+        rt = event_resolution_ts(e)
+        if rt is None or rt < now:
+            continue
+        yes_tok, no_tok = event_yes_no_token_ids(e)
+        if not (yes_tok and no_tok):
+            continue
+        markets = e.get("markets") or []
+        cid = (markets[0].get("conditionId") if markets else None) or e.get("id")
+        if not cid:
             continue
         upsert_market(
-            condition_id=m["condition_id"],
-            question=m["question"],
+            condition_id=str(cid),
+            question=e.get("title", ""),
             resolution_ts=rt,
-            yes_token_id=m["yes_token_id"],
-            no_token_id=m["no_token_id"],
+            yes_token_id=yes_tok,
+            no_token_id=no_tok,
         )
         saved += 1
     return saved

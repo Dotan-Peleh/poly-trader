@@ -43,13 +43,13 @@ class Settings(BaseSettings):
     trading_mode: Literal["paper", "live"] = "paper"
     starting_capital: float = 100.0           # USD (Polymarket = USDC)
 
-    # Strategy thresholds (calibrated for Kalshi 15-min binaries)
+    # Strategy thresholds (calibrated for Polymarket 5-min binaries)
     edge_threshold: float = 0.04              # 4% min edge to fire
-    min_seconds_to_close: int = 60            # don't fire in last minute
-    max_minutes_to_close: int = 12            # within the 15-min window only
+    min_seconds_to_close: int = 30            # don't fire in last 30s (Polygon block lag)
+    max_minutes_to_close: int = 4             # only fire in last 4 of 5 minutes
     kelly_fraction_divisor: float = 4.0       # quarter-Kelly
     max_position_pct: float = 0.05            # cap per trade at 5% bankroll
-    max_concurrent_trades: int = 2            # 2 overlapping 15-min windows max
+    max_concurrent_trades: int = 2            # 2 overlapping 5-min windows max
     daily_loss_limit_pct: float = 0.08        # halt entries at -8% daily
 
     # Vol estimator
@@ -62,11 +62,20 @@ class Settings(BaseSettings):
     kalshi_api_key_id: str = ""               # populated in live mode from Secret Manager
     # signing private key never stored in code — Secret Manager only
 
-    # Polymarket (kept for future re-use if hourly BTC product relists)
+    # Polymarket (PRIMARY VENUE — 5-min BTC up/down via Gamma + CLOB)
+    polymarket_gamma_base: str = "https://gamma-api.polymarket.com"
     polymarket_clob_base: str = "https://clob.polymarket.com"
     polymarket_chain_id: int = 137
     polygon_rpc_url: str = "https://polygon-rpc.com"
-    polymarket_wallet_address: str = ""
+    # Window length for the BTC events we trade (minutes)
+    polymarket_window_minutes: int = 5
+
+    # Live trading credentials (HMAC, not raw private key — generated
+    # from Polymarket UI Settings → API Keys, stored in Secret Manager)
+    polymarket_api_key: str = ""
+    polymarket_api_secret: str = ""
+    polymarket_api_passphrase: str = ""
+    polymarket_funder_address: str = ""    # the proxy wallet address, NOT your EOA
 
     # Binance WS (free, no auth)
     binance_ws_url: str = "wss://stream.binance.com:9443/ws/btcusdt@trade"
@@ -134,8 +143,15 @@ if not settings.telegram_chat_id:
         settings.telegram_chat_id = s
         logger.info("Telegram chat id loaded from Secret Manager")
 
-if settings.trading_mode == "live" and not settings.polymarket_wallet_address:
-    s = _fetch_secret_manager("polymarket-wallet-address")
-    if s:
-        settings.polymarket_wallet_address = s
-        logger.info("Polymarket wallet address loaded from Secret Manager")
+if settings.trading_mode == "live":
+    for fld, secret_name in [
+        ("polymarket_api_key", "polymarket-api-key"),
+        ("polymarket_api_secret", "polymarket-api-secret"),
+        ("polymarket_api_passphrase", "polymarket-api-passphrase"),
+        ("polymarket_funder_address", "polymarket-funder-address"),
+    ]:
+        if not getattr(settings, fld):
+            v = _fetch_secret_manager(secret_name)
+            if v:
+                setattr(settings, fld, v)
+                logger.info(f"Polymarket secret loaded: {secret_name}")

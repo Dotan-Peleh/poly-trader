@@ -79,7 +79,7 @@ def _get_client():
         chain_id=POLYGON,
         key=_pk(),
         creds=creds,
-        signature_type=2,                       # POLY_GNOSIS_SAFE
+        signature_type=int(settings.polymarket_signature_type),  # 1 = POLY_PROXY (Magic Link)
         funder=settings.polymarket_funder_address,
     )
     _client_cache["client"] = client

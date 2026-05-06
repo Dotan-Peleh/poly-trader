@@ -78,6 +78,11 @@ class Settings(BaseSettings):
     polymarket_funder_address: str = ""    # the proxy/Safe wallet address, NOT your EOA
     polymarket_private_key: str = ""       # NEVER store in plaintext settings; loaded
                                             # from Secret Manager at runtime in live mode
+    # Signature type for the ClobClient:
+    #   0 = EOA (direct signing, rare)
+    #   1 = POLY_PROXY (Magic Link email/Google login users — DEFAULT)
+    #   2 = GNOSIS_SAFE (MetaMask / wallet-connect users)
+    polymarket_signature_type: int = 1
 
     # Binance WS (free, no auth)
     binance_ws_url: str = "wss://stream.binance.com:9443/ws/btcusdt@trade"

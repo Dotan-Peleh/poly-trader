@@ -43,26 +43,30 @@ class Settings(BaseSettings):
     trading_mode: Literal["paper", "live"] = "paper"
     starting_capital: float = 100.0           # USD (Polymarket = USDC)
 
-    # Strategy thresholds
+    # Strategy thresholds (calibrated for Kalshi 15-min binaries)
     edge_threshold: float = 0.04              # 4% min edge to fire
     min_seconds_to_close: int = 60            # don't fire in last minute
-    max_minutes_to_close: int = 15            # don't fire if too far out
+    max_minutes_to_close: int = 12            # within the 15-min window only
     kelly_fraction_divisor: float = 4.0       # quarter-Kelly
     max_position_pct: float = 0.05            # cap per trade at 5% bankroll
-    max_concurrent_trades: int = 3            # don't overlap too many markets at once
+    max_concurrent_trades: int = 2            # 2 overlapping 15-min windows max
     daily_loss_limit_pct: float = 0.08        # halt entries at -8% daily
 
     # Vol estimator
     vol_window_minutes: int = 30              # EWMA half-life
     min_sigma_per_minute: float = 0.0001      # floor: 0.01%/min (avoid div-by-zero)
 
-    # Polymarket
+    # Kalshi (primary venue — KXBTC15M binary product)
+    kalshi_api_base: str = "https://api.elections.kalshi.com/trade-api/v2"
+    kalshi_series_ticker: str = "KXBTC15M"    # 15-minute BTC up/down
+    kalshi_api_key_id: str = ""               # populated in live mode from Secret Manager
+    # signing private key never stored in code — Secret Manager only
+
+    # Polymarket (kept for future re-use if hourly BTC product relists)
     polymarket_clob_base: str = "https://clob.polymarket.com"
-    polymarket_chain_id: int = 137            # Polygon mainnet
+    polymarket_chain_id: int = 137
     polygon_rpc_url: str = "https://polygon-rpc.com"
-    polymarket_wallet_address: str = ""       # set from secret in live mode
-    # signing key NEVER stored in code or settings — pulled from Secret Manager
-    # at signing time and never logged.
+    polymarket_wallet_address: str = ""
 
     # Binance WS (free, no auth)
     binance_ws_url: str = "wss://stream.binance.com:9443/ws/btcusdt@trade"

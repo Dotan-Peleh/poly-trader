@@ -21,7 +21,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from config.settings import settings
 from data.storage import init_db
-from data import binance_ws, polymarket_client, reference_tracker
+from data import binance_ws, kalshi_client, reference_tracker
 from monitor.notifier import Notifier
 from monitor.heartbeat import write_heartbeat
 from monitor.halt_flag import is_halted
@@ -33,26 +33,27 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def polymarket_refresh_tick(notifier: Notifier):
+def kalshi_refresh_tick(notifier: Notifier):
+    """Pull active KXBTC15M events into the markets table."""
     if is_halted():
         logger.info("HALT active — skipping market refresh")
         return
     try:
-        n = polymarket_client.refresh_markets()
-        logger.info(f"polymarket_refresh: {n} active BTC hourly markets")
+        n = kalshi_client.refresh_markets()
+        logger.info(f"kalshi_refresh: {n} active KXBTC15M markets")
     except Exception as e:
-        logger.error(f"polymarket_refresh failed: {e}")
+        logger.error(f"kalshi_refresh failed: {e}")
 
 
-def polymarket_book_tick():
-    """Snapshot order books for every active market with end_date in next 30 min."""
+def kalshi_book_tick():
+    """Snapshot the order book for every active market resolving in next 20 min."""
     if is_halted():
         return
     try:
         from sqlalchemy.orm import Session
         from data.storage import engine, PolymarketMarket
         from models.realized_vol import latest_btc_price
-        cutoff = datetime.utcnow() + timedelta(minutes=30)
+        cutoff = datetime.utcnow() + timedelta(minutes=20)
         with Session(engine) as session:
             ms = (session.query(PolymarketMarket)
                   .filter(PolymarketMarket.state == "active",
@@ -61,16 +62,14 @@ def polymarket_book_tick():
                   .all())
         btc_now = latest_btc_price()
         for m in ms:
-            polymarket_client.snapshot_market(
-                condition_id=m.condition_id,
-                yes_token=m.yes_token_id,
-                no_token=m.no_token_id,
+            kalshi_client.snapshot_market(
+                market_ticker=m.condition_id,
                 btc_price_now=btc_now,
             )
         if ms:
-            logger.info(f"polymarket_book: snapshotted {len(ms)} markets")
+            logger.info(f"kalshi_book: snapshotted {len(ms)} markets")
     except Exception as e:
-        logger.error(f"polymarket_book_tick failed: {e}")
+        logger.error(f"kalshi_book_tick failed: {e}")
 
 
 def reference_backfill_tick():
@@ -115,10 +114,10 @@ def main():
     logger.info("Binance WS thread started")
 
     scheduler = BackgroundScheduler(timezone="UTC")
-    scheduler.add_job(polymarket_refresh_tick, "interval", minutes=2,
-                       args=[notifier], id="polymarket_refresh")
-    scheduler.add_job(polymarket_book_tick, "interval", seconds=30,
-                       id="polymarket_book")
+    scheduler.add_job(kalshi_refresh_tick, "interval", minutes=2,
+                       args=[notifier], id="kalshi_refresh")
+    scheduler.add_job(kalshi_book_tick, "interval", seconds=30,
+                       id="kalshi_book")
     scheduler.add_job(reference_backfill_tick, "interval", minutes=5,
                        id="reference_backfill")
     scheduler.add_job(decision_tick, "interval", seconds=5,

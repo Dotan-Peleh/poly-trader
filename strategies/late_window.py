@@ -129,7 +129,60 @@ def evaluate_market(market: PolymarketMarket, wallet: Wallet, portfolio: Portfol
     if final_size < 1.0:
         return None
 
-    # Persist paper trade
+    # ── LIVE branch: place a real Polymarket order ──────────────────
+    fill_units = sizing.units
+    fill_price = sizing.paid_per_unit
+    if settings.trading_mode == "live":
+        from execution.polymarket_orders import (
+            place_market_order, cap_for_smoke_period, daily_loss_halts,
+            LIVE_MAX_TRADE_USD,
+        )
+        # Daily loss halt
+        from execution.wallet import Wallet as _W
+        today_pnl = _W().realized_pnl()
+        if daily_loss_halts(today_pnl):
+            if notifier:
+                notifier.send(
+                    f"🛑 <b>Daily loss halt</b> — refusing new entries "
+                    f"(today P&L ${today_pnl:+.2f})"
+                )
+            return None
+        # Smoke-period cap (first 24h)
+        bot_started = getattr(evaluate_market, "_bot_started_at", datetime.utcnow())
+        evaluate_market._bot_started_at = bot_started
+        capped_size = cap_for_smoke_period(final_size, bot_started)
+        if capped_size < final_size:
+            logger.info(
+                f"[{market.condition_id}] smoke-period cap: "
+                f"${final_size:.2f} → ${capped_size:.2f}"
+            )
+            final_size = capped_size
+
+        # Choose token to BUY: YES token for a YES bet, NO token for a NO bet
+        token_id = (market.yes_token_id if intent.side == "YES"
+                     else market.no_token_id)
+        if not token_id:
+            if notifier:
+                notifier.send(
+                    f"⚠️ <code>{market.condition_id}</code>: missing "
+                    f"{intent.side} token id — cannot place live order"
+                )
+            return None
+        ask = yes_ask if intent.side == "YES" else no_ask
+        fill = place_market_order(token_id, intent.side, final_size, ask)
+        if not fill.success:
+            err = fill.raw_response.get("error", "unknown")
+            if notifier:
+                notifier.send(
+                    f"❌ <b>LIVE order failed</b> on {intent.side} "
+                    f"<code>{market.condition_id}</code>\n"
+                    f"💡 {err[:200]}"
+                )
+            return None
+        fill_units = fill.units
+        fill_price = fill.paid_per_unit
+
+    # Persist trade row (paper or live; outcome backfilled at settlement)
     decision_id = record_paper_trade(
         condition_id=market.condition_id,
         side=intent.side,
@@ -141,7 +194,7 @@ def evaluate_market(market: PolymarketMarket, wallet: Wallet, portfolio: Portfol
         implied_yes_prob=intent.implied_yes_prob,
         edge=intent.edge,
         size_usd=final_size,
-        paid_per_unit=sizing.paid_per_unit,
+        paid_per_unit=fill_price,
     )
 
     icon = "🟢" if intent.side == "YES" else "🔴"

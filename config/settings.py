@@ -75,7 +75,9 @@ class Settings(BaseSettings):
     polymarket_api_key: str = ""
     polymarket_api_secret: str = ""
     polymarket_api_passphrase: str = ""
-    polymarket_funder_address: str = ""    # the proxy wallet address, NOT your EOA
+    polymarket_funder_address: str = ""    # the proxy/Safe wallet address, NOT your EOA
+    polymarket_private_key: str = ""       # NEVER store in plaintext settings; loaded
+                                            # from Secret Manager at runtime in live mode
 
     # Binance WS (free, no auth)
     binance_ws_url: str = "wss://stream.binance.com:9443/ws/btcusdt@trade"
@@ -148,10 +150,12 @@ if settings.trading_mode == "live":
         ("polymarket_api_key", "polymarket-api-key"),
         ("polymarket_api_secret", "polymarket-api-secret"),
         ("polymarket_api_passphrase", "polymarket-api-passphrase"),
-        ("polymarket_funder_address", "polymarket-funder-address"),
+        ("polymarket_funder_address", "polymarket-funder"),
+        ("polymarket_private_key", "polymarket-pk"),
     ]:
         if not getattr(settings, fld):
             v = _fetch_secret_manager(secret_name)
             if v:
                 setattr(settings, fld, v)
+                # Don't log the value — only the name
                 logger.info(f"Polymarket secret loaded: {secret_name}")

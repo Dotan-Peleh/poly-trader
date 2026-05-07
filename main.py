@@ -89,13 +89,26 @@ def reference_backfill_tick():
         logger.error(f"reference_backfill failed: {e}")
 
 
-def wallet_snapshot_tick():
-    """Pull live Polymarket wallet state (balance + positions + recent trades)
-    and upload a JSON snapshot to GCS for the dashboard. Live-mode only."""
+def exit_manager_tick(notifier: Notifier):
+    """Every 10s: scan open positions for take-profit/stop-loss/time-bailout
+    early exits. Polymarket binaries are sellable any time before close.
+    Works in BOTH paper and live mode."""
     if is_halted():
         return
-    from monitor.halt_flag import effective_mode
-    if effective_mode() != "live":
+    try:
+        from strategies.exit_manager import evaluate_open_positions
+        closed = evaluate_open_positions(notifier=notifier)
+        if closed:
+            logger.info(f"exit_manager: closed {closed} positions early")
+    except Exception as e:
+        logger.error(f"exit_manager_tick failed: {e}")
+
+
+def wallet_snapshot_tick():
+    """Pull Polymarket wallet state (balance + positions + recent trades)
+    and upload a JSON snapshot to GCS for the dashboard. Runs in BOTH
+    paper and live mode so the dashboard always reflects the real wallet."""
+    if is_halted():
         return
     try:
         from data.polymarket_wallet import write_wallet_snapshot
@@ -213,11 +226,13 @@ def main():
                        id="reference_backfill")
     scheduler.add_job(decision_tick, "interval", seconds=5,
                        args=[notifier], id="decision_tick")
+    scheduler.add_job(exit_manager_tick, "interval", seconds=10,
+                       args=[notifier], id="exit_manager_tick")
     scheduler.add_job(settle_tick, "interval", seconds=60,
                        args=[notifier], id="settle_tick")
     scheduler.add_job(write_heartbeat, "interval", minutes=5,
                        id="heartbeat")
-    scheduler.add_job(wallet_snapshot_tick, "interval", minutes=2,
+    scheduler.add_job(wallet_snapshot_tick, "interval", seconds=30,
                        id="wallet_snapshot")
     scheduler.start()
     logger.info("Scheduler started")

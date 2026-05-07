@@ -98,11 +98,12 @@ def _fetch_recent_trades(limit: int = 50) -> list:
 
 
 def write_wallet_snapshot():
-    """Build a wallet snapshot JSON and upload to GCS for the dashboard."""
-    from monitor.halt_flag import effective_mode
-    if effective_mode() != "live":
-        # In paper mode, the wallet doesn't apply
-        return
+    """Build a wallet snapshot JSON and upload to GCS for the dashboard.
+    Runs in BOTH paper and live mode — your real wallet balance + open
+    positions exist regardless of bot mode. Skips only if creds are
+    missing (so a fresh deployment without secrets doesn't error)."""
+    if not (settings.polymarket_api_key and settings.polymarket_private_key):
+        return  # not configured — skip silently
     snapshot = {
         "ts": datetime.utcnow().isoformat() + "Z",
         "funder": settings.polymarket_funder_address,

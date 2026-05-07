@@ -89,30 +89,44 @@ def evaluate_market(market: PolymarketMarket, wallet: Wallet, portfolio: Portfol
     if intent.side == "SKIP":
         return None
 
+    # ── Extreme-tail filter — no lottery tickets ─────────────────────
+    # The digital pricer is most reliable when implied is between 5%
+    # and 95%. At the tails (<5% or >95%) tiny vol-estimate noise
+    # creates apparent 'edge' that's really just market makers being
+    # right. The 30-min live run lost \$75 buying YES tokens at 2¢ here.
+    side_ask = yes_ask if intent.side == "YES" else no_ask
+    if side_ask < 0.05 or side_ask > 0.95:
+        logger.info(
+            f"[{market.condition_id}] tail-filter: skipping {intent.side} "
+            f"at ask {side_ask:.3f} (extreme tail; model edge is likely noise)"
+        )
+        return None
+
     # Portfolio gate
     can, gate_reason = portfolio.can_open(market.condition_id)
     if not can:
         logger.info(f"[{market.condition_id}] portfolio block: {gate_reason}")
         return None
 
-    # Claude gate (optional)
+    # Claude gate (optional). Notification policy:
+    #   • REJECT → log only (no Telegram noise — vetoes were spammy)
+    #   • REQUEST_SIZE_CUT → log only (still a trade, fires below)
+    #   • APPROVE / UNAVAILABLE → silent, normal flow
     size_mult = 1.0
     if claude_gate is not None:
         verdict = claude_gate(market, quote, intent, wallet)
         if verdict["decision"] == "REJECT":
-            if notifier:
-                notifier.send(
-                    f"🤖❌ <b>Claude VETOED</b> {intent.side} on <code>{market.condition_id}</code>\n"
-                    f"💡 {verdict.get('reason', '')[:200]}"
-                )
+            logger.info(
+                f"[{market.condition_id}] CLAUDE REJECT {intent.side}: "
+                f"{verdict.get('reason', '')[:160]}"
+            )
             return None
         elif verdict["decision"] == "REQUEST_SIZE_CUT":
             size_mult = 0.5
-            if notifier:
-                notifier.send(
-                    f"🤖⚠️ <b>Claude HALF-SIZE</b> {intent.side} on <code>{market.condition_id}</code>\n"
-                    f"💡 {verdict.get('reason', '')[:200]}"
-                )
+            logger.info(
+                f"[{market.condition_id}] CLAUDE HALF-SIZE {intent.side}: "
+                f"{verdict.get('reason', '')[:160]}"
+            )
 
     # Size the trade
     bankroll = wallet.available_balance()

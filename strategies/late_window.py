@@ -130,9 +130,12 @@ def evaluate_market(market: PolymarketMarket, wallet: Wallet, portfolio: Portfol
         return None
 
     # ── LIVE branch: place a real Polymarket order ──────────────────
+    # effective_mode() reads gs://.../poly_live/mode.txt at runtime so the
+    # dashboard can flip live↔paper without a restart.
+    from monitor.halt_flag import effective_mode
     fill_units = sizing.units
     fill_price = sizing.paid_per_unit
-    if settings.trading_mode == "live":
+    if effective_mode() == "live":
         from execution.polymarket_orders import (
             place_market_order, cap_for_smoke_period, daily_loss_halts,
             LIVE_MAX_TRADE_USD,

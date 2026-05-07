@@ -94,7 +94,8 @@ def wallet_snapshot_tick():
     and upload a JSON snapshot to GCS for the dashboard. Live-mode only."""
     if is_halted():
         return
-    if settings.trading_mode != "live":
+    from monitor.halt_flag import effective_mode
+    if effective_mode() != "live":
         return
     try:
         from data.polymarket_wallet import write_wallet_snapshot

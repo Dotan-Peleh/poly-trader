@@ -99,7 +99,8 @@ def _fetch_recent_trades(limit: int = 50) -> list:
 
 def write_wallet_snapshot():
     """Build a wallet snapshot JSON and upload to GCS for the dashboard."""
-    if settings.trading_mode != "live":
+    from monitor.halt_flag import effective_mode
+    if effective_mode() != "live":
         # In paper mode, the wallet doesn't apply
         return
     snapshot = {

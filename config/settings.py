@@ -43,15 +43,12 @@ class Settings(BaseSettings):
     trading_mode: Literal["paper", "live"] = "paper"
     starting_capital: float = 100.0           # USD (Polymarket = USDC)
 
-    # Strategy thresholds (recalibrated 2026-05-08 after 17 consecutive live
-    # losses on Polymarket 5-min binaries totaling ~$310. Findings: 4% edge
-    # was too liberal, mid-range entries (0.50-0.75) all reverted, position
-    # sizes ballooned past the 24h smoke cap. Tightening across the board.)
-    edge_threshold: float = 0.07              # was 0.04 — need ≥7% model edge to fire
+    # Strategy thresholds (calibrated for Polymarket 5-min binaries)
+    edge_threshold: float = 0.04              # 4% min edge to fire
     min_seconds_to_close: int = 30            # don't fire in last 30s (Polygon block lag)
     max_minutes_to_close: int = 4             # only fire in last 4 of 5 minutes
-    kelly_fraction_divisor: float = 8.0       # was 4.0 (quarter-Kelly) → eighth-Kelly until edge proven
-    max_position_pct: float = 0.01            # was 0.05 → cap per trade at 1% bankroll (~$5 on $500)
+    kelly_fraction_divisor: float = 4.0       # quarter-Kelly
+    max_position_pct: float = 0.05            # cap per trade at 5% bankroll
     max_concurrent_trades: int = 2            # 2 overlapping 5-min windows max
     daily_loss_limit_pct: float = 0.08        # halt entries at -8% daily
 
@@ -122,11 +119,11 @@ settings = Settings()
 # When trading_mode == "live", clamp anything that could over-risk on a
 # small bankroll. Same defensive pattern as crypto-trader/config/settings.py.
 if settings.trading_mode == "live":
-    if settings.max_position_pct > 0.01:
+    if settings.max_position_pct > 0.05:
         logger.warning(
-            f"LIVE: clamping max_position_pct {settings.max_position_pct} → 0.01"
+            f"LIVE: clamping max_position_pct {settings.max_position_pct} → 0.05"
         )
-        settings.max_position_pct = 0.01
+        settings.max_position_pct = 0.05
     if settings.max_concurrent_trades > 3:
         logger.warning(
             f"LIVE: clamping max_concurrent_trades {settings.max_concurrent_trades} → 3"

@@ -33,9 +33,11 @@ logger = logging.getLogger(__name__)
 
 
 # Live-mode safety caps (overridable via env later if needed)
-LIVE_MAX_TRADE_USD = 5.0           # hard cap per trade — first 24h
-LIVE_MAX_TRADE_USD_BUMP_HOURS = 24  # after this many hours, max_position_pct rules
-LIVE_DAILY_LOSS_HALT_USD = 10.0     # halt new entries at this realized daily loss
+# Updated 2026-05-08 after 17 live losses (~$310). The 24h "bump" let
+# Kelly produce $80–$94 stakes that all reverted. Cap is now permanent.
+LIVE_MAX_TRADE_USD = 5.0           # hard cap per trade — PERMANENT
+LIVE_MAX_TRADE_USD_BUMP_HOURS = 99999  # effectively never lift the cap until edge is proven
+LIVE_DAILY_LOSS_HALT_USD = 5.0     # was 10 — halt at smaller daily drawdown given the loss streak
 
 
 _client_cache: dict = {"client": None, "ts": 0.0}
@@ -181,11 +183,10 @@ def place_market_order(token_id: str, side: str, size_usd: float,
 
 
 def cap_for_smoke_period(proposed_size_usd: float, bot_started_at: datetime) -> float:
-    """First 24h cap: $5 per trade regardless of Kelly math."""
-    age_hours = (datetime.utcnow() - bot_started_at).total_seconds() / 3600
-    if age_hours < LIVE_MAX_TRADE_USD_BUMP_HOURS:
-        return min(proposed_size_usd, LIVE_MAX_TRADE_USD)
-    return proposed_size_usd
+    """Hard cap of $5 per trade. The earlier 'bump after 24h' produced
+    $80–$94 stakes with 100% loss rate. Cap stays in place permanently
+    until we see a sustained positive edge in paper mode."""
+    return min(proposed_size_usd, LIVE_MAX_TRADE_USD)
 
 
 def daily_loss_halts(realized_pnl_usd_today: float) -> bool:

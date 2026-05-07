@@ -89,16 +89,17 @@ def evaluate_market(market: PolymarketMarket, wallet: Wallet, portfolio: Portfol
     if intent.side == "SKIP":
         return None
 
-    # ── Extreme-tail filter — no lottery tickets ─────────────────────
-    # The digital pricer is most reliable when implied is between 5%
-    # and 95%. At the tails (<5% or >95%) tiny vol-estimate noise
-    # creates apparent 'edge' that's really just market makers being
-    # right. The 30-min live run lost \$75 buying YES tokens at 2¢ here.
+    # ── Price-band filter — only fire in the 0.20–0.80 sweet spot ────
+    # Tightened 2026-05-08 from [0.05, 0.95] after 17 live losses where
+    # entries at 0.77 / 0.94 / 0.71 all reverted. The pricer is reliable
+    # in the middle of the distribution but late-window high-confidence
+    # entries (>0.80) are dominated by mean-reversion in the final
+    # minute, not the residual probability the model thinks it sees.
     side_ask = yes_ask if intent.side == "YES" else no_ask
-    if side_ask < 0.05 or side_ask > 0.95:
+    if side_ask < 0.20 or side_ask > 0.80:
         logger.info(
-            f"[{market.condition_id}] tail-filter: skipping {intent.side} "
-            f"at ask {side_ask:.3f} (extreme tail; model edge is likely noise)"
+            f"[{market.condition_id}] price-band-filter: skipping {intent.side} "
+            f"at ask {side_ask:.3f} (outside [0.20, 0.80] reliable zone)"
         )
         return None
 

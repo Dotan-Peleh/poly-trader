@@ -59,11 +59,24 @@ def list_btc_events(window_minutes: int = 5, limit: int = 500) -> list[dict]:
 
     window_minutes: 5, 15, 60, 240, etc. We filter by computing the
     duration from the event title's start/end times.
+
+    Bug history: previous query used `order=startDate&ascending=false` which
+    returns events with the LATEST startDate first — i.e. tomorrow's
+    pre-created markets — so the bot would see 42 active markets but every
+    one of them resolved 20+ hours in the future, far outside its 4-min
+    decision window. Switched to endDate ascending + end_date_min=NOW so
+    we get markets ending soonest, which is what the late-window strategy
+    actually trades.
     """
     out: list[dict] = []
     try:
+        from datetime import datetime as _dt
+        end_min = _dt.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
         with _gamma_client() as c:
-            r = c.get(f"/events?closed=false&order=startDate&ascending=false&limit={limit}")
+            r = c.get(
+                f"/events?closed=false&order=endDate&ascending=true"
+                f"&end_date_min={end_min}&limit={limit}"
+            )
             r.raise_for_status()
             events = r.json()
             if not isinstance(events, list):

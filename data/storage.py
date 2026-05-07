@@ -21,7 +21,26 @@ from sqlalchemy.orm import declarative_base, Session
 from config.settings import settings
 
 Base = declarative_base()
-engine = create_engine(settings.database_url, future=True)
+# SQLite-specific tuning: WAL mode + 30s busy timeout. Without this, the
+# decision_tick (every 5s) and polymarket_refresh_tick (every 2 min) compete
+# for the single writer lock and the refresh task fails with
+# "database is locked" — which is why the markets table goes stale and the
+# bot has no markets in window to evaluate.
+_is_sqlite = settings.database_url.startswith("sqlite")
+engine = create_engine(
+    settings.database_url,
+    future=True,
+    connect_args={"timeout": 30, "check_same_thread": False} if _is_sqlite else {},
+)
+if _is_sqlite:
+    from sqlalchemy import event as _sa_event
+    @_sa_event.listens_for(engine, "connect")
+    def _enable_wal(dbapi_conn, _conn_record):
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("PRAGMA synchronous=NORMAL")
+        cur.execute("PRAGMA busy_timeout=30000")
+        cur.close()
 
 
 class BtcTick(Base):

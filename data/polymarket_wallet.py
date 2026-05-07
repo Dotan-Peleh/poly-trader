@@ -28,6 +28,51 @@ logger = logging.getLogger(__name__)
 
 _data_api_base = "https://data-api.polymarket.com"
 
+# Polymarket migrated their CLOB collateral from USDC.e to pUSD (Polymarket
+# USD). The CLOB API's get_balance_allowance(asset_type=COLLATERAL) still
+# returns the legacy USDC.e number — for active accounts that's $0. Real
+# trading capital sits as pUSD on Polygon. We read it directly so the
+# dashboard / bot see the same number as the Polymarket UI.
+PUSD_CONTRACT = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+POLYGON_RPCS = (
+    "https://polygon.gateway.tenderly.co",
+    "https://rpc.ankr.com/polygon",
+    "https://polygon-mainnet.public.blastapi.io",
+    "https://polygon-rpc.com",
+)
+
+
+def _fetch_pusd_balance(funder: str) -> Optional[float]:
+    """Read the funder's pUSD ERC-20 balance via Polygon JSON-RPC. Returns
+    USD float (pUSD has 6 decimals). Tries multiple public RPCs and
+    returns the first non-error result. Returns None on total failure."""
+    if not funder or not funder.startswith("0x") or len(funder) != 42:
+        return None
+    padded = funder[2:].lower().rjust(64, "0")
+    data = "0x70a08231" + padded  # balanceOf(address) selector
+    payload = json.dumps({
+        "jsonrpc": "2.0",
+        "method": "eth_call",
+        "params": [{"to": PUSD_CONTRACT, "data": data}, "latest"],
+        "id": 1,
+    }).encode("utf-8")
+    for rpc in POLYGON_RPCS:
+        try:
+            req = urllib.request.Request(
+                rpc, data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=8) as r:
+                resp = json.loads(r.read().decode("utf-8"))
+            hex_result = resp.get("result")
+            if hex_result and hex_result.startswith("0x") and len(hex_result) > 2:
+                return int(hex_result, 16) / 1_000_000.0  # pUSD has 6 decimals
+        except Exception as e:
+            logger.debug(f"pUSD RPC {rpc} failed: {e}")
+            continue
+    return None
+
 
 def _gcp_token() -> Optional[str]:
     try:
@@ -40,24 +85,44 @@ def _gcp_token() -> Optional[str]:
 
 
 def _fetch_balance() -> dict:
-    """USDC balance + allowance via the ClobClient (HMAC-authenticated)."""
+    """Read the trading balance Polymarket actually uses today (pUSD).
+
+    Returns three signals so the dashboard / sizer can pick the right one:
+      • usdc       = LEGACY CLOB USDC.e collateral (almost always 0 today)
+      • pusd       = REAL trading capital, read on-chain from Polygon
+      • effective  = pusd if non-None else usdc (the value to size against)
+    """
+    out: dict = {"raw": None, "usdc": None, "pusd": None, "effective": None}
+    # 1) Legacy USDC.e via the CLOB (kept for compatibility / debugging).
     try:
         from execution.polymarket_orders import _get_client
         from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
         client = _get_client()
         params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         resp = client.get_balance_allowance(params)
-        # Polymarket returns balance + allowance in micro-USDC (6 decimals)
         bal = resp.get("balance") if isinstance(resp, dict) else None
         if bal is not None:
             try:
-                bal = float(bal) / 1_000_000.0  # USDC has 6 decimals
+                bal = float(bal) / 1_000_000.0
             except Exception:
                 pass
-        return {"raw": resp, "usdc": bal}
+        out["raw"] = resp
+        out["usdc"] = bal
     except Exception as e:
-        logger.warning(f"_fetch_balance failed: {e}")
-        return {"raw": None, "usdc": None, "error": str(e)[:200]}
+        logger.debug(f"_fetch_balance (CLOB USDC.e) failed: {e}")
+        out["error"] = str(e)[:200]
+
+    # 2) Real pUSD ERC-20 balance from Polygon RPC.
+    try:
+        from config.settings import settings as _s
+        funder = getattr(_s, "polymarket_funder_address", "")
+        pusd = _fetch_pusd_balance(funder) if funder else None
+        out["pusd"] = pusd
+    except Exception as e:
+        logger.debug(f"_fetch_balance (pUSD on-chain) failed: {e}")
+
+    out["effective"] = out["pusd"] if out["pusd"] is not None else out["usdc"]
+    return out
 
 
 def _fetch_positions() -> list:

@@ -202,11 +202,14 @@ def write_wallet_snapshot():
             method="POST",
         )
         urllib.request.urlopen(req, timeout=10).read()
-        bal = snapshot.get("balance", {}).get("usdc")
+        bal_block = snapshot.get("balance", {}) or {}
         n_pos = len(snapshot.get("positions") or [])
         n_trd = len(snapshot.get("recent_trades") or [])
         logger.info(
-            f"wallet_snapshot: balance=${bal} positions={n_pos} trades={n_trd}"
+            f"wallet_snapshot: pUSD=${bal_block.get('pusd')} "
+            f"usdc.e=${bal_block.get('usdc')} "
+            f"effective=${bal_block.get('effective')} "
+            f"positions={n_pos} trades={n_trd}"
         )
     except Exception as e:
         logger.warning(f"wallet_snapshot upload failed: {e}")

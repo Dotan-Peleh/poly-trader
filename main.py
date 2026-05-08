@@ -237,10 +237,29 @@ def main():
     scheduler.start()
     logger.info("Scheduler started")
 
+    # Startup message must reflect REAL state, not the hard-coded launch
+    # args. Mode is the runtime flag in GCS (the dashboard toggles it).
+    # Capital is the on-chain pUSD balance — your actual trading USD —
+    # not the static $100 starting_capital config.
+    try:
+        from monitor.halt_flag import effective_mode as _eff_mode
+        runtime_mode = _eff_mode() or args.mode
+    except Exception:
+        runtime_mode = args.mode
+    try:
+        from data.polymarket_wallet import _fetch_pusd_balance
+        real_pusd = _fetch_pusd_balance(settings.polymarket_funder_address)
+    except Exception:
+        real_pusd = None
+    cap_line = (
+        f"Capital (pUSD on-chain): ${real_pusd:,.2f}"
+        if real_pusd is not None
+        else f"Capital (config): ${args.capital:,.2f}"
+    )
     notifier.send(
         f"🎲 <b>poly-trader started</b>\n"
-        f"Mode: {args.mode}\n"
-        f"Capital: ${args.capital:,.2f}\n"
+        f"Mode: {runtime_mode}\n"
+        f"{cap_line}\n"
         f"Phase 1: data feeds (BTC ticks + Polymarket books)"
     )
 

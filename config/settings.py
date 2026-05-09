@@ -43,13 +43,13 @@ class Settings(BaseSettings):
     trading_mode: Literal["paper", "live"] = "paper"
     starting_capital: float = 100.0           # USD (Polymarket = USDC)
 
-    # Strategy thresholds (calibrated for Polymarket 15-min binaries)
+    # Strategy thresholds (calibrated for Polymarket 60-min binaries)
     edge_threshold: float = 0.04              # 4% min edge to fire
-    min_seconds_to_close: int = 60            # don't fire in last 60s (Polygon block lag)
-    max_minutes_to_close: int = 12            # fire in the first 12 of last 15 min (skip the dead-cert tail)
+    min_seconds_to_close: int = 120           # skip the last 2 min — settle volatility
+    max_minutes_to_close: int = 55            # fire 5–55 min before close (real uncertainty window)
     kelly_fraction_divisor: float = 4.0       # quarter-Kelly
     max_position_pct: float = 0.05            # cap per trade at 5% bankroll
-    max_concurrent_trades: int = 2            # 2 overlapping windows max
+    max_concurrent_trades: int = 3            # 3 overlapping 60-min windows max
     daily_loss_limit_pct: float = 0.08        # halt entries at -8% daily
 
     # Vol estimator
@@ -68,10 +68,10 @@ class Settings(BaseSettings):
     polymarket_chain_id: int = 137
     polygon_rpc_url: str = "https://polygon-rpc.com"
     # Window length for the BTC events we trade (minutes).
-    # 5-min markets settle too fast — by the time the bot can evaluate,
-    # prices snap to 0.99/0.01 and the tail filter rejects everything.
-    # 15-min markets keep meaningful uncertainty 10+ min from close.
-    polymarket_window_minutes: int = 15
+    # 5-min and 15-min markets snap to 0.99/0.01 within minutes — bot
+    # rejects every candidate. 60-min markets keep meaningful uncertainty
+    # 30+ min from close, which is well within the firing window.
+    polymarket_window_minutes: int = 60
 
     # Live trading credentials (HMAC, not raw private key — generated
     # from Polymarket UI Settings → API Keys, stored in Secret Manager)

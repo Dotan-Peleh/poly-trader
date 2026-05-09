@@ -52,15 +52,15 @@ def polymarket_refresh_tick(notifier: Notifier):
 
 
 def polymarket_book_tick():
-    """Snapshot YES + NO order books for every market resolving in next 20 min.
-    Widened from 10→20 to cover 15-min markets across their full firing window."""
+    """Snapshot YES + NO order books for every market resolving in next 60 min.
+    Widened to 60 min to cover 60-min markets across their full firing window."""
     if is_halted():
         return
     try:
         from sqlalchemy.orm import Session
         from data.storage import engine, PolymarketMarket
         from models.realized_vol import latest_btc_price
-        cutoff = datetime.utcnow() + timedelta(minutes=20)
+        cutoff = datetime.utcnow() + timedelta(minutes=60)
         with Session(engine) as session:
             ms = (session.query(PolymarketMarket)
                   .filter(PolymarketMarket.state == "active",

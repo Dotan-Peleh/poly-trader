@@ -94,6 +94,8 @@ def evaluate_market(market: PolymarketMarket, wallet: Wallet, portfolio: Portfol
     # and 95%. At the tails (<5% or >95%) tiny vol-estimate noise
     # creates apparent 'edge' that's really just market makers being
     # right. The 30-min live run lost \$75 buying YES tokens at 2¢ here.
+    # 60-min markets have real uncertainty 30+ min from close, so the
+    # tight bound is appropriate (no need to loosen for activity).
     side_ask = yes_ask if intent.side == "YES" else no_ask
     if side_ask < 0.05 or side_ask > 0.95:
         logger.info(

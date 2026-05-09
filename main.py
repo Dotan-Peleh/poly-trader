@@ -52,15 +52,16 @@ def polymarket_refresh_tick(notifier: Notifier):
 
 
 def polymarket_book_tick():
-    """Snapshot YES + NO order books for every market resolving in next 60 min.
-    Widened to 60 min to cover 60-min markets across their full firing window."""
+    """Snapshot YES + NO books for every market resolving in next 35 min.
+    Pre_window strategy fires at 6-30 min to resolution — 35 covers that
+    window plus a buffer for snapshot lag."""
     if is_halted():
         return
     try:
         from sqlalchemy.orm import Session
         from data.storage import engine, PolymarketMarket
         from models.realized_vol import latest_btc_price
-        cutoff = datetime.utcnow() + timedelta(minutes=60)
+        cutoff = datetime.utcnow() + timedelta(minutes=35)
         with Session(engine) as session:
             ms = (session.query(PolymarketMarket)
                   .filter(PolymarketMarket.state == "active",
@@ -121,14 +122,17 @@ def wallet_snapshot_tick():
 
 
 def decision_tick(notifier: Notifier):
-    """Phase 2: sweep markets in firing window, run pricer + Claude gate,
-    record paper trades."""
+    """Phase 2 v2: pre-window strategy. Fires BEFORE the 5-min measurement
+    window opens, when books are at ~50/50 with real depth. See
+    strategies/pre_window.py for the full thesis."""
     if is_halted():
         return
     try:
-        from strategies.late_window import decision_tick_impl
-        from claude_decision.decision import claude_gate
-        n = decision_tick_impl(notifier=notifier, claude_gate=claude_gate)
+        from strategies.pre_window import decision_tick_impl
+        # claude_gate is wired for late_window's signature; pre_window v1
+        # ignores it (passes None). v2 will adapt the gate to use signal
+        # decomposition instead of vol-based BinaryQuote.
+        n = decision_tick_impl(notifier=notifier, claude_gate=None)
         if n:
             logger.info(f"decision_tick: fired {n} paper trade(s)")
     except Exception as e:

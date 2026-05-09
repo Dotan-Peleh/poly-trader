@@ -165,8 +165,18 @@ def fetch_book(token_id: str) -> Optional[dict]:
 
 
 def book_top(book: Optional[dict]) -> tuple[Optional[float], Optional[float], float]:
-    """(best_bid, best_ask, depth_usd_top5) from a CLOB book.
-    Polymarket returns prices in [0, 1] (decimal probability)."""
+    """(best_bid, best_ask, depth_usd_near_market) from a CLOB book.
+
+    BUGFIX 2026-05-09: Polymarket's /book endpoint returns bids/asks UNSORTED.
+    The old implementation took bids[0]/asks[0] directly — which was the
+    WORST order, not the best. On a real 0.50/0.51 market that stored
+    0.01/0.99 (placeholder edges) and the tail filter rejected every
+    candidate. Caused weeks of false rejections. Now we sort first.
+
+    Depth metric also tightened: only orders within ±5% of best price.
+    The old metric summed all top-5 orders incl. placeholders, making
+    every market look $50k deep when real tradable depth was $200-500.
+    """
     if not book:
         return None, None, 0.0
     bids = book.get("bids") or []
@@ -177,12 +187,27 @@ def book_top(book: Optional[dict]) -> tuple[Optional[float], Optional[float], fl
             return float(r.get("price", 0)), float(r.get("size", 0))
         return float(r[0]), float(r[1]) if len(r) > 1 else 0.0
 
-    best_bid = _row(bids[0])[0] if bids else None
-    best_ask = _row(asks[0])[0] if asks else None
+    # Sort: bids descending (best = highest), asks ascending (best = lowest)
+    bids_sorted = sorted(bids, key=lambda r: -_row(r)[0])
+    asks_sorted = sorted(asks, key=lambda r: _row(r)[0])
+
+    best_bid = _row(bids_sorted[0])[0] if bids_sorted else None
+    best_ask = _row(asks_sorted[0])[0] if asks_sorted else None
+
+    # Near-market depth: orders within 5% of best price on each side
     depth = 0.0
-    for r in bids[:5] + asks[:5]:
-        p, s = _row(r)
-        depth += p * s
+    if best_bid is not None:
+        for r in bids_sorted[:10]:
+            p, s = _row(r)
+            if p < best_bid * 0.95:
+                break
+            depth += p * s
+    if best_ask is not None:
+        for r in asks_sorted[:10]:
+            p, s = _row(r)
+            if p > best_ask * 1.05:
+                break
+            depth += p * s
     return best_bid, best_ask, round(depth, 2)
 
 

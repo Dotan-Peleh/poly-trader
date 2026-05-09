@@ -43,13 +43,20 @@ class Settings(BaseSettings):
     trading_mode: Literal["paper", "live"] = "paper"
     starting_capital: float = 100.0           # USD (Polymarket = USDC)
 
-    # Strategy thresholds (calibrated for Polymarket 60-min binaries)
-    edge_threshold: float = 0.04              # 4% min edge to fire
-    min_seconds_to_close: int = 120           # skip the last 2 min — settle volatility
-    max_minutes_to_close: int = 55            # fire 5–55 min before close (real uncertainty window)
+    # Strategy thresholds (pre_window v2 — fires BEFORE measurement window opens)
+    edge_threshold: float = 0.04              # 4% min |fair − implied| to fire
+    # Late_window (legacy) bounds — kept so settle_resolved_markets and other
+    # late_window code paths still resolve. Pre_window has its own bounds below.
+    min_seconds_to_close: int = 120
+    max_minutes_to_close: int = 55
+    # Pre-window bounds: fire 6–30 min before resolution. At T-30 BTC has
+    # weak predictive signal; at T-6 the next 5-min window is about to open
+    # and momentum/imbalance signals are freshest.
+    pre_window_min_minutes: int = 6
+    pre_window_max_minutes: int = 30
     kelly_fraction_divisor: float = 4.0       # quarter-Kelly
     max_position_pct: float = 0.05            # cap per trade at 5% bankroll
-    max_concurrent_trades: int = 3            # 3 overlapping 60-min windows max
+    max_concurrent_trades: int = 3
     daily_loss_limit_pct: float = 0.08        # halt entries at -8% daily
 
     # Vol estimator
@@ -68,10 +75,11 @@ class Settings(BaseSettings):
     polymarket_chain_id: int = 137
     polygon_rpc_url: str = "https://polygon-rpc.com"
     # Window length for the BTC events we trade (minutes).
-    # 5-min and 15-min markets snap to 0.99/0.01 within minutes — bot
-    # rejects every candidate. 60-min markets keep meaningful uncertainty
-    # 30+ min from close, which is well within the firing window.
-    polymarket_window_minutes: int = 60
+    # Counter-intuitive: 5-min markets are the right ones to trade — but
+    # ONLY in the pre-window phase (before the 5-min measurement window
+    # opens), where books are at clean 50/50 with $300+ depth per side.
+    # 15-min and 60-min markets had no real two-sided liquidity in our recon.
+    polymarket_window_minutes: int = 5
 
     # Live trading credentials (HMAC, not raw private key — generated
     # from Polymarket UI Settings → API Keys, stored in Secret Manager)

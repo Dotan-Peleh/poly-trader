@@ -18,8 +18,10 @@ import time
 from datetime import datetime, timedelta
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.events import EVENT_JOB_EXECUTED
 
 from config.settings import settings
+from monitor.health import start_health_server, mark_alive
 from data.storage import init_db
 from data import binance_ws, polymarket_client, reference_tracker
 # Kalshi client kept available for venue switching but not wired by default
@@ -218,7 +220,14 @@ def main():
     ws_thread.start()
     logger.info("Binance WS thread started")
 
+    # Sidecar watchdog reads /health on port 8766; mark_alive on every job
+    # so a deadlocked scheduler triggers HTTP 503 within 10 min.
+    start_health_server()
     scheduler = BackgroundScheduler(timezone="UTC")
+    scheduler.add_listener(
+        lambda evt: mark_alive(evt.job_id),
+        EVENT_JOB_EXECUTED,
+    )
     scheduler.add_job(polymarket_refresh_tick, "interval", minutes=2,
                        args=[notifier], id="polymarket_refresh")
     scheduler.add_job(polymarket_book_tick, "interval", seconds=20,

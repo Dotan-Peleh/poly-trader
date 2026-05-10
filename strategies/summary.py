@@ -113,8 +113,14 @@ def build_summary_message(label: str, emoji: str, hours_back: int = 12) -> str:
             key=lambda r: r.id,
         )[-5:]
 
+    # Split by strategy tag so we can compare v1 (no notes) vs v2_meanrev
+    v1_fires = [r for r in all_fires if not (r.notes or "").startswith("v2_")]
+    v2_fires = [r for r in all_fires if (r.notes or "").startswith("v2_")]
+
     rec = _summarize(recent)
     alltime = _summarize(all_fires)
+    v1_block = _summarize(v1_fires) if v1_fires else None
+    v2_block = _summarize(v2_fires) if v2_fires else None
     sides = _side_breakdown(all_fires)
     cal = _calibration_buckets(all_fires)
 
@@ -134,6 +140,15 @@ def build_summary_message(label: str, emoji: str, hours_back: int = 12) -> str:
                  f"({alltime['win_rate_pct']:.0f}% win rate)")
     lines.append(f"  P&amp;L: <b>${alltime['pnl_usd']:+.2f}</b>")
     lines.append("")
+    if v1_block and v2_block:
+        lines.append("<b>Strategy A/B</b>")
+        lines.append(f"  v1 (momentum): {v1_block['resolved']} resolved, "
+                     f"{v1_block['wins']}W ({v1_block['win_rate_pct']:.0f}%) "
+                     f"${v1_block['pnl_usd']:+.2f}")
+        lines.append(f"  v2_meanrev:    {v2_block['resolved']} resolved, "
+                     f"{v2_block['wins']}W ({v2_block['win_rate_pct']:.0f}%) "
+                     f"${v2_block['pnl_usd']:+.2f}")
+        lines.append("")
     lines.append("<b>By side</b>")
     for side in ("YES", "NO"):
         d = sides[side]

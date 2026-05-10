@@ -54,11 +54,20 @@ logger = logging.getLogger(__name__)
 # ── Constants ────────────────────────────────────────────────────────────
 SIGNAL_FAIR_FLOOR = 0.30
 SIGNAL_FAIR_CEIL = 0.70
-MAX_MOMENTUM_BIAS = 0.07     # ±7% prob from BTC momentum
+# v2 (2026-05-10): inverted momentum → mean-reversion. v1's calibration
+# data (n=19) showed Strong YES bucket was 80% wrong and NO side 0/8 —
+# consistent with BTC mean-reverting at 5-min horizons rather than
+# continuing. We bet AGAINST recent move rather than with it.
+MAX_REVERSION_BIAS = 0.07    # ±7% prob from inverted momentum
 MAX_IMBALANCE_BIAS = 0.03    # ±3% prob from book imbalance
+BASE_YES_PRIOR = 0.505       # BTC has slight long-run drift; 0.5% YES bias
 MAX_PLACEHOLDER_SUM = 1.05   # yes_ask + no_ask above this = no real liquidity
 TAIL_FILTER_LO = 0.10        # don't pay < $0.10 on a side (deep tail)
 TAIL_FILTER_HI = 0.90        # don't pay > $0.90 on a side (deep tail)
+# Consecutive-loss cooldown (risk management, no martingale)
+COOLDOWN_3_LOSSES_HOURS = 1.0
+COOLDOWN_5_LOSSES_HOURS = 6.0
+STRATEGY_TAG = "v2_meanrev"  # written to Decision.notes for A/B split
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -95,7 +104,7 @@ def _btc_return_over(minutes: int) -> float:
 @dataclass(frozen=True)
 class Signal:
     fair_yes_prob: float
-    momentum_bias: float
+    reversion_bias: float
     imbalance_bias: float
     btc_15min_return: float
     sigma_15min: float
@@ -107,29 +116,83 @@ def compute_signal(
     yes_depth_usd: float,
     no_depth_usd: float,
 ) -> Signal:
-    """Combine momentum + imbalance into fair P(YES wins) for a future window."""
+    """v2 (2026-05-10): mean-reversion + book imbalance + slight YES prior.
+
+    v1 was momentum-following and lost 13/19 trades. Calibration data
+    showed Strong YES bucket was 80% wrong and NO side 0/8 wins —
+    classic signature of BTC mean-reverting at 5-min horizons in this
+    vol regime. v2 inverts the momentum tail: after a STRONG up-move
+    we bet NO (expecting reversion), after a STRONG down-move we bet
+    YES (expecting bounce). Soft moves stay near 50/50.
+    """
     sigma_15min = sigma_per_minute * math.sqrt(15.0) if sigma_per_minute > 0 else 0.001
 
-    # Momentum: z-score of 15-min return vs vol, capped, then tanh-mapped
+    # z-score of recent return; clip extremes to keep tanh well-behaved
     z = (btc_15min_return / sigma_15min) if sigma_15min > 0 else 0.0
     z_clipped = max(-2.0, min(2.0, z))
-    momentum_bias = MAX_MOMENTUM_BIAS * math.tanh(z_clipped)
+    # NEGATIVE coefficient = inverted momentum. After +1σ up, bias DOWN.
+    reversion_bias = -MAX_REVERSION_BIAS * math.tanh(z_clipped)
 
-    # Imbalance: more $ on NO side = retail leans DOWN; small fade signal
+    # Imbalance: more $ on NO ask = MMs willing to sell NO cheap; we lean YES
     total = yes_depth_usd + no_depth_usd
     imbalance = ((no_depth_usd - yes_depth_usd) / total) if total > 1.0 else 0.0
     imbalance_bias = MAX_IMBALANCE_BIAS * imbalance
 
-    fair = 0.5 + momentum_bias + imbalance_bias
+    # Base prior slightly above 0.50: BTC has long-run positive drift.
+    # Over a 5-min window the drift contribution is tiny but cumulatively
+    # it pushes 0/8 NO outcomes seen in v1 toward more balanced sides.
+    fair = BASE_YES_PRIOR + reversion_bias + imbalance_bias
     fair = max(SIGNAL_FAIR_FLOOR, min(SIGNAL_FAIR_CEIL, fair))
 
     return Signal(
         fair_yes_prob=fair,
-        momentum_bias=momentum_bias,
+        reversion_bias=reversion_bias,
         imbalance_bias=imbalance_bias,
         btc_15min_return=btc_15min_return,
         sigma_15min=sigma_15min,
     )
+
+
+# ── Cooldown manager ─────────────────────────────────────────────────────
+
+def _cooldown_active() -> Optional[str]:
+    """Return reason string if a consecutive-loss cooldown is active, else None.
+    Counts consecutive losses (most recent backward) across all decisions
+    with size_usd > 0 and resolution_yes set."""
+    with Session(engine) as session:
+        # Most recent N resolved decisions (any tag)
+        recent = (session.query(Decision)
+                  .filter(Decision.size_usd > 0,
+                          Decision.resolution_yes.isnot(None))
+                  .order_by(Decision.id.desc())
+                  .limit(5).all())
+    if not recent:
+        return None
+
+    def _is_loss(d: Decision) -> bool:
+        if d.resolution_yes is None: return False
+        won = (d.resolution_yes == 1 and d.side == "YES") or \
+              (d.resolution_yes == 0 and d.side == "NO")
+        return not won
+
+    consecutive = 0
+    last_loss_ts: Optional[datetime] = None
+    for d in recent:
+        if _is_loss(d):
+            consecutive += 1
+            if last_loss_ts is None:
+                last_loss_ts = d.resolved_at or d.ts
+        else:
+            break
+
+    now = datetime.utcnow()
+    if consecutive >= 5 and last_loss_ts is not None:
+        if (now - last_loss_ts) < timedelta(hours=COOLDOWN_5_LOSSES_HOURS):
+            return f"5-loss cooldown ({consecutive} in a row, {COOLDOWN_5_LOSSES_HOURS}h)"
+    if consecutive >= 3 and last_loss_ts is not None:
+        if (now - last_loss_ts) < timedelta(hours=COOLDOWN_3_LOSSES_HOURS):
+            return f"3-loss cooldown ({consecutive} in a row, {COOLDOWN_3_LOSSES_HOURS}h)"
+    return None
 
 
 # ── Per-market evaluator ─────────────────────────────────────────────────
@@ -239,21 +302,33 @@ def evaluate_market(
         paid_per_unit=sizing.paid_per_unit,
     )
 
+    # Tag the row so the summary can A/B v1 vs v2 cleanly
+    try:
+        from sqlalchemy import update
+        with Session(engine) as session:
+            session.execute(
+                update(Decision).where(Decision.id == decision_id)
+                .values(notes=STRATEGY_TAG)
+            )
+            session.commit()
+    except Exception as e:
+        logger.debug(f"could not tag decision with strategy version: {e}")
+
     reason = (f"pre-window {side}: fair={sig.fair_yes_prob:.3f} vs implied={implied_yes:.3f} "
-              f"(mom={sig.momentum_bias:+.3f}, imb={sig.imbalance_bias:+.3f}, "
+              f"(rev={sig.reversion_bias:+.3f}, imb={sig.imbalance_bias:+.3f}, "
               f"btc_15m_ret={btc_ret_15m*100:+.2f}%, T-{minutes_to_close:.1f}min)")
     logger.info(f"FIRED {side} {market.condition_id[:24]}... size=${final_size:.2f} "
                  f"@ {sizing.paid_per_unit:.3f} | edge={edge*100:+.1f}% | {reason}")
     if notifier:
         icon = "🟢" if side == "YES" else "🔴"
         notifier.send(
-            f"{icon} <b>{side} fired (pre-window)</b> "
+            f"{icon} <b>{side} fired ({STRATEGY_TAG})</b> "
             f"<code>{market.condition_id[:24]}...</code>\n"
             f"📊 fair={sig.fair_yes_prob*100:.1f}% vs implied={implied_yes*100:.1f}%\n"
             f"💸 edge={edge*100:+.1f}% | size=${final_size:.2f} "
             f"({sizing.units:.0f} contracts @ {sizing.paid_per_unit*100:.0f}¢)\n"
             f"⏱ T-{minutes_to_close:.1f}min | "
-            f"mom={sig.momentum_bias:+.3f}, imb={sig.imbalance_bias:+.3f}\n"
+            f"rev={sig.reversion_bias:+.3f}, imb={sig.imbalance_bias:+.3f}\n"
             f"💡 BTC 15m ret={btc_ret_15m*100:+.2f}%, σ_15m={sig.sigma_15min*100:.2f}%"
         )
 
@@ -268,6 +343,21 @@ def evaluate_market(
 
 def decision_tick_impl(notifier=None, claude_gate=None) -> int:
     """Sweep every active market in pre-window. Returns count of fires."""
+    # Risk management: pause new entries after consecutive losses
+    cd_reason = _cooldown_active()
+    if cd_reason is not None:
+        # Log once per minute at most so we don't spam at 5s tick rate
+        global _LAST_COOLDOWN_LOG_TS
+        try:
+            last = _LAST_COOLDOWN_LOG_TS
+        except NameError:
+            last = None
+        nowts = datetime.utcnow()
+        if last is None or (nowts - last).total_seconds() > 60:
+            logger.info(f"cooldown active: {cd_reason}")
+            globals()["_LAST_COOLDOWN_LOG_TS"] = nowts
+        return 0
+
     wallet = Wallet()
     portfolio = PortfolioGuard()
     fires = 0

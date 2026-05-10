@@ -68,6 +68,15 @@ TAIL_FILTER_HI = 0.90        # don't pay > $0.90 on a side (deep tail)
 COOLDOWN_3_LOSSES_HOURS = 1.0
 COOLDOWN_5_LOSSES_HOURS = 6.0
 STRATEGY_TAG = "v2_meanrev"  # written to Decision.notes for A/B split
+# When implied is far from 0.50, the market has information we don't.
+# Cap on |edge| above this means our model is fighting a screaming market —
+# almost always the model is wrong (first v2 fire: paid 0.34, fair 0.525,
+# claimed edge 19%, lost). Only trade when edge is in a sane band.
+MAX_EDGE_FOR_FIRE = 0.10
+# Implied probability band: only fire when market is uncertain (near 50/50).
+# Outside this band, the market has too much info advantage.
+IMPLIED_BAND_LO = 0.40
+IMPLIED_BAND_HI = 0.60
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -253,7 +262,22 @@ def evaluate_market(
     )
 
     edge = sig.fair_yes_prob - implied_yes
+    # Lower bound: need at least edge_threshold (4%) to overcome fees + noise
     if abs(edge) < settings.edge_threshold:
+        return None
+    # Upper bound: when our model disagrees too much with the market, the
+    # market is almost always right. First v2 fire: implied=0.34 (market
+    # signaling strong DOWN), our model said 0.525, claimed +19% edge — lost.
+    if abs(edge) > MAX_EDGE_FOR_FIRE:
+        logger.info(f"[{market.condition_id}] edge-cap: skipping fair={sig.fair_yes_prob:.3f} "
+                     f"vs implied={implied_yes:.3f} (|edge|={abs(edge)*100:.1f}% > {MAX_EDGE_FOR_FIRE*100:.0f}%) "
+                     f"— market has info we don't")
+        return None
+    # Implied band: only trade when market is uncertain (near 50/50). Outside
+    # this band, the market is signaling it knows where BTC is going.
+    if implied_yes < IMPLIED_BAND_LO or implied_yes > IMPLIED_BAND_HI:
+        logger.info(f"[{market.condition_id}] implied-band: skipping implied={implied_yes:.3f} "
+                     f"(outside [{IMPLIED_BAND_LO},{IMPLIED_BAND_HI}]) — market not uncertain enough")
         return None
 
     side = "YES" if edge > 0 else "NO"

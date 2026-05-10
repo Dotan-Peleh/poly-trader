@@ -113,9 +113,17 @@ def build_summary_message(label: str, emoji: str, hours_back: int = 12) -> str:
             key=lambda r: r.id,
         )[-5:]
 
-    # Split by strategy tag so we can compare v1 (no notes) vs v2_meanrev
-    v1_fires = [r for r in all_fires if not (r.notes or "").startswith("v2_")]
-    v2_fires = [r for r in all_fires if (r.notes or "").startswith("v2_")]
+    # Split by strategy tag so we can compare v1 (no v2 mention) vs v2_meanrev.
+    # v2 trades may have notes like:
+    #   "v2_meanrev"                                — held to resolution
+    #   "early_exit:tp_1.81x|v2_meanrev"            — exit_manager closed early
+    #   "early_exit:sl_0.38x|v2_meanrev_inferred"   — backfilled tag
+    # so we use 'v2_' substring match across the whole notes string.
+    def _is_v2(r):
+        n = r.notes or ""
+        return "v2_meanrev" in n
+    v1_fires = [r for r in all_fires if not _is_v2(r)]
+    v2_fires = [r for r in all_fires if _is_v2(r)]
 
     rec = _summarize(recent)
     alltime = _summarize(all_fires)

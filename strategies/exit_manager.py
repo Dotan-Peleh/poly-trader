@@ -83,10 +83,20 @@ def _resolve_paper_at_mid(decision_id: int, current_mid: float, reason: str
         fee = size * PAPER_FEE_RATE
         pnl_usd = proceeds - size - fee
 
-        d.resolution_yes = None  # NOT a regular resolution; flag via notes
+        # Resolution: derive boolean win/loss from realized P&L so summary
+        # queries that filter on resolution_yes IS NOT NULL pick this up.
+        # (Previously left as None, hiding early exits from win-rate stats.)
+        won = pnl_usd > 0
+        if side == "YES":
+            d.resolution_yes = 1 if won else 0
+        else:  # NO bet — won if BTC ended NO; resolution_yes 0 = NO won
+            d.resolution_yes = 0 if won else 1
         d.pnl_usd = round(pnl_usd, 4)
         d.resolved_at = datetime.utcnow()
-        d.notes = f"early_exit:{reason}"
+        # Preserve original strategy tag so v1/v2 A/B can still be split.
+        # Format: early_exit:reason|original_tag (e.g. early_exit:tp_1.81x|v2_meanrev)
+        prev = (d.notes or "").strip()
+        d.notes = f"early_exit:{reason}|{prev}" if prev else f"early_exit:{reason}"
         session.commit()
 
         return {

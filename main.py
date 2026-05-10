@@ -248,6 +248,16 @@ def main():
                        id="heartbeat")
     scheduler.add_job(wallet_snapshot_tick, "interval", seconds=30,
                        id="wallet_snapshot")
+    # Twice-daily Telegram summary so user can see win/loss + calibration
+    # without opening the dashboard. Times chosen to land in Israel
+    # daytime hours (11:00 + 23:00 IL = 08:00 + 20:00 UTC).
+    from strategies.summary import poly_summary
+    scheduler.add_job(poly_summary, "cron", hour=8, minute=0,
+                       args=["morning", "🌅", notifier], id="poly_summary_morning",
+                       coalesce=True, max_instances=1, misfire_grace_time=600)
+    scheduler.add_job(poly_summary, "cron", hour=20, minute=0,
+                       args=["evening", "🌙", notifier], id="poly_summary_evening",
+                       coalesce=True, max_instances=1, misfire_grace_time=600)
     scheduler.start()
     logger.info("Scheduler started")
 

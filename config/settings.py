@@ -57,7 +57,10 @@ class Settings(BaseSettings):
     kelly_fraction_divisor: float = 4.0       # quarter-Kelly
     max_position_pct: float = 0.05            # cap per trade at 5% bankroll
     max_concurrent_trades: int = 3
-    daily_loss_limit_pct: float = 0.08        # halt entries at -8% daily
+    daily_loss_limit_pct: float = 0.20        # halt entries at -20% daily
+    # Raised from 0.08 → 0.20 on 2026-05-10 so v2_meanrev has runway to
+    # generate 50+ trades despite v1's $15.52 daily loss tripping the
+    # breaker. Tighten back to 0.08 once v2 has settled calibration data.
 
     # Vol estimator
     vol_window_minutes: int = 30              # EWMA half-life

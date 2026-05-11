@@ -41,7 +41,9 @@ def _fetch_secret_manager(name: str, project: str = "crypto-agent-494710") -> st
 class Settings(BaseSettings):
     # Trading mode
     trading_mode: Literal["paper", "live"] = "paper"
-    starting_capital: float = 100.0           # USD (Polymarket = USDC)
+    starting_capital: float = 500.0           # USD paper bankroll — realistic
+                                              # size for smart-money copy strategy
+                                              # ($30 was too small after Polygon gas)
 
     # Strategy thresholds (pre_window v2 — fires BEFORE measurement window opens)
     edge_threshold: float = 0.04              # 4% min |fair − implied| to fire

@@ -114,11 +114,12 @@ def _parse_log(log: dict) -> Optional[RealTimeSignal]:
         topics = log.get("topics") or []
         if len(topics) < 4 or topics[0].lower() != TRANSFER_SINGLE_TOPIC:
             return None
+        operator = _decode_address(topics[1]).lower()
         from_addr = _decode_address(topics[2]).lower()
-        # Only count transfers FROM the exchange (= trades). Skip user-to-user.
-        if from_addr != CTF_EXCHANGE.lower():
-            return None
         to_addr = _decode_address(topics[3]).lower()
+        # Skip redemptions (transfer to zero address) and self-transfers
+        if to_addr == "0x0000000000000000000000000000000000000000":
+            return None
         data = log.get("data", "")
         if data.startswith("0x"):
             data = data[2:]
@@ -154,19 +155,17 @@ async def _ws_loop(api_key: str, on_signal):
     import websockets  # lazy import — only needed when stream runs
     url = f"wss://polygon-mainnet.g.alchemy.com/v2/{api_key}"
     async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
-        # Subscribe to ConditionalTokens TransferSingle events where
-        # from = CTF_EXCHANGE (= buy fills). The `to` topic IS the buyer's
-        # wallet, so we get direct attribution without API calls.
+        # Subscribe to ALL TransferSingle events on ConditionalTokens.
+        # Polymarket uses several exchange/relayer contracts; rather than
+        # whitelisting operators we accept everything (~80 events/sec) and
+        # post-filter by `to` in Python (cheap SQLite lookup vs rankings).
+        # We DROP zero-address transfers (= token redemptions, not trades)
+        # in the parser.
         sub_req = {
             "jsonrpc": "2.0", "id": 1, "method": "eth_subscribe",
             "params": ["logs", {
                 "address": CONDITIONAL_TOKENS,
-                "topics": [
-                    TRANSFER_SINGLE_TOPIC,
-                    None,                                  # operator (any)
-                    _pad_address_topic(CTF_EXCHANGE),      # from = exchange
-                    # to filter is None — we want all buyers, then post-match
-                ],
+                "topics": [TRANSFER_SINGLE_TOPIC],
             }],
         }
         await ws.send(json.dumps(sub_req))

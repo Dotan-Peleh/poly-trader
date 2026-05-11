@@ -44,8 +44,11 @@ logger = logging.getLogger(__name__)
 # Polymarket CTF Exchange on Polygon Mainnet
 CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
 
-# keccak256("OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)")
-ORDER_FILLED_TOPIC = "0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6"
+# Actual on-chain topic hash for Polymarket CTFExchange trade events.
+# Verified by querying live logs from the contract — the keccak256 of
+# OrderFilled(bytes32,address,address,...) didn't match, so the on-chain
+# signature differs from public docs. We use the actual topic seen on chain.
+ORDER_FILLED_TOPIC = "0xbc9a2432e8aeb48327246cddd6e872ef452812b4243c04e6bfb786a2cd8faf0d"
 
 
 @dataclass(frozen=True)
@@ -70,6 +73,22 @@ def _decode_uint(hex_str: str) -> int:
 def _decode_address(topic: str) -> str:
     # 32-byte topic, address is the rightmost 20 bytes
     return "0x" + topic[-40:]
+
+
+# PHASE 2 LIMITATION DISCOVERED 2026-05-11:
+# The CTFExchange OrderFilled event (topic 0xbc9a2432...) has 3 indexed
+# bytes32 fields (takerOrderHash, makerOrderHash, conditionId) and EMPTY
+# data. No wallet addresses. So we can detect TRADES in real-time but
+# can't immediately attribute to a wallet.
+#
+# Two paths forward (Phase 2.5):
+#   1. Subscribe to ConditionalTokens TransferSingle (has indexed `to`
+#      address — direct wallet identification on receipt of tokens)
+#   2. Resolve orderHash → wallet via Polymarket CLOB API /order/{hash}
+#
+# For now polygon_stream provides on-chain trade rate sensing + heartbeat
+# but copy-execution still goes through the 30s /positions poll (which
+# DOES yield wallet attribution from data-api).
 
 
 def _parse_log(log: dict) -> Optional[RealTimeSignal]:

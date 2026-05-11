@@ -258,6 +258,16 @@ def main():
     scheduler.add_job(poly_summary, "cron", hour=20, minute=0,
                        args=["evening", "🌙", notifier], id="poly_summary_evening",
                        coalesce=True, max_instances=1, misfire_grace_time=600)
+    # Smart-money copy-trading — Phase 2. Re-rank wallet list every 12h;
+    # poll positions every 90s. Phase 3 (copy execution) hooks decision_tick.
+    from strategies.smart_money import refresh_tick as smart_refresh_tick
+    from strategies.smart_money import poll_tick as smart_poll_tick
+    scheduler.add_job(smart_refresh_tick, "cron", hour="*/12", minute=5,
+                       args=[notifier], id="smart_money_refresh",
+                       coalesce=True, max_instances=1, misfire_grace_time=600)
+    scheduler.add_job(smart_poll_tick, "interval", seconds=90,
+                       args=[notifier], id="smart_money_poll",
+                       coalesce=True, max_instances=1, misfire_grace_time=120)
     scheduler.start()
     logger.info("Scheduler started")
 

@@ -227,6 +227,61 @@ def main():
     ws_thread.start()
     logger.info("Binance WS thread started")
 
+    # ── Phase 2: Polygon RPC real-time stream ──────────────────────────
+    # Subscribe to OrderFilled events from Polymarket CTF Exchange on chain.
+    # Sub-second latency from on-chain confirmation to signal. Only starts
+    # if Alchemy key is available (graceful degrade for paper/dev runs).
+    if getattr(settings, "polygon_alchemy_api_key", ""):
+        try:
+            from data.polygon_stream import start_stream_in_thread, RealTimeSignal
+
+            # Use a closure to track stream health: count events, log a
+            # heartbeat every 100. Confirms the WebSocket is alive even
+            # when no tracked-wallet trades come through.
+            _stream_stats = {"events": 0, "tracked_hits": 0, "last_log": 0}
+
+            def _on_realtime_signal(sig):
+                import time as _tm
+                _stream_stats["events"] += 1
+                # Heartbeat: every 100 events OR every 5 min, whichever first
+                if (_stream_stats["events"] % 100 == 0
+                    or _tm.time() - _stream_stats["last_log"] > 300):
+                    logger.info(
+                        f"polygon_stream: heartbeat — "
+                        f"{_stream_stats['events']} events seen, "
+                        f"{_stream_stats['tracked_hits']} tracked-wallet hits"
+                    )
+                    _stream_stats["last_log"] = _tm.time()
+                # Match against rankings table
+                try:
+                    from sqlalchemy.orm import Session
+                    from sqlalchemy import text as _t
+                    from data.storage import engine as _eng
+                    with Session(_eng) as s:
+                        row = s.execute(_t(
+                            "SELECT pseudonym, realized_pnl_lifetime FROM "
+                            "smart_wallet_rankings WHERE wallet = :w"
+                        ), {"w": sig.wallet}).first()
+                    if not row:
+                        return  # not on our radar
+                    _stream_stats["tracked_hits"] += 1
+                    logger.info(
+                        f"polygon_stream: ⚡ TRACKED WALLET {sig.wallet[:12]} "
+                        f"({row[0] or 'anon'}, lifetime ${row[1] or 0:,.0f}) "
+                        f"@ {sig.price:.3f} × {sig.amount_filled:.0f} "
+                        f"block {sig.block_number}"
+                    )
+                    # Phase 2.5 — wire to copy executor here.
+                except Exception as e:
+                    logger.warning(f"polygon_stream signal handler: {e}")
+
+            start_stream_in_thread(settings.polygon_alchemy_api_key,
+                                     _on_realtime_signal)
+        except Exception as e:
+            logger.error(f"polygon_stream failed to start: {e}")
+    else:
+        logger.info("polygon_stream: no Alchemy key set — Phase 2 disabled")
+
     # Sidecar watchdog reads /health on port 8766; mark_alive on every job
     # so a deadlocked scheduler triggers HTTP 503 within 10 min.
     start_health_server()

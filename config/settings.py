@@ -100,6 +100,10 @@ class Settings(BaseSettings):
     #   2 = GNOSIS_SAFE (MetaMask / wallet-connect users)
     polymarket_signature_type: int = 1
 
+    # Alchemy Polygon RPC — for real-time WebSocket on OrderFilled events.
+    # Loaded from Secret Manager (polygon-alchemy-key) at runtime.
+    polygon_alchemy_api_key: str = ""
+
     # Binance WS (free, no auth)
     binance_ws_url: str = "wss://stream.binance.com:9443/ws/btcusdt@trade"
 
@@ -168,6 +172,15 @@ if not settings.telegram_chat_id:
     if s:
         settings.telegram_chat_id = s
         logger.info("Telegram chat id loaded from Secret Manager")
+
+# Polygon RPC (Alchemy) — needed for Phase 2 WebSocket scanner. Load always
+# (not gated on live mode) since paper-mode bot also benefits from
+# real-time signal detection.
+if not settings.polygon_alchemy_api_key:
+    v = _fetch_secret_manager("polygon-alchemy-key")
+    if v:
+        settings.polygon_alchemy_api_key = v
+        logger.info("Polygon Alchemy key loaded from Secret Manager")
 
 if settings.trading_mode == "live":
     for fld, secret_name in [

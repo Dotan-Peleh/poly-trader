@@ -113,24 +113,41 @@ def build_summary_message(label: str, emoji: str, hours_back: int = 12) -> str:
             key=lambda r: r.id,
         )[-5:]
 
-    # Split by strategy tag so we can compare v1 (no v2 mention) vs v2_meanrev.
-    # v2 trades may have notes like:
-    #   "v2_meanrev"                                — held to resolution
-    #   "early_exit:tp_1.81x|v2_meanrev"            — exit_manager closed early
-    #   "early_exit:sl_0.38x|v2_meanrev_inferred"   — backfilled tag
-    # so we use 'v2_' substring match across the whole notes string.
+    # Split by strategy tag so we can compare across versions.
+    # Tags seen in notes (substring match anywhere in the string):
+    #   "v2_meanrev" / "v2_meanrev_inferred"  — v2 mean-reversion
+    #   "smart_copy:<wallet_name>|<addr>"     — smart-money copy trades
+    #   "early_exit:..." prefix may be prepended by exit_manager
     def _is_v2(r):
         n = r.notes or ""
-        return "v2_meanrev" in n
-    v1_fires = [r for r in all_fires if not _is_v2(r)]
+        return "v2_meanrev" in n and "smart_copy" not in n
+    def _is_smart_copy(r):
+        return "smart_copy" in (r.notes or "")
+    v1_fires = [r for r in all_fires if not _is_v2(r) and not _is_smart_copy(r)]
     v2_fires = [r for r in all_fires if _is_v2(r)]
+    smart_fires = [r for r in all_fires if _is_smart_copy(r)]
 
     rec = _summarize(recent)
     alltime = _summarize(all_fires)
     v1_block = _summarize(v1_fires) if v1_fires else None
     v2_block = _summarize(v2_fires) if v2_fires else None
+    smart_block = _summarize(smart_fires) if smart_fires else None
     sides = _side_breakdown(all_fires)
     cal = _calibration_buckets(all_fires)
+
+    # Per-smart-wallet breakdown (for the copy strategy)
+    smart_by_wallet = {}
+    for r in smart_fires:
+        n = r.notes or ""
+        # parse "smart_copy:NAME|addr" possibly prefixed by "early_exit:..."
+        idx = n.find("smart_copy:")
+        if idx < 0:
+            continue
+        rest = n[idx + len("smart_copy:"):]
+        name = rest.split("|", 1)[0]
+        if name not in smart_by_wallet:
+            smart_by_wallet[name] = []
+        smart_by_wallet[name].append(r)
 
     pnl_emoji = "🟢" if rec["pnl_usd"] >= 0 else "🔴"
 
@@ -148,14 +165,29 @@ def build_summary_message(label: str, emoji: str, hours_back: int = 12) -> str:
                  f"({alltime['win_rate_pct']:.0f}% win rate)")
     lines.append(f"  P&amp;L: <b>${alltime['pnl_usd']:+.2f}</b>")
     lines.append("")
-    if v1_block and v2_block:
+    if v1_block or v2_block or smart_block:
         lines.append("<b>Strategy A/B</b>")
-        lines.append(f"  v1 (momentum): {v1_block['resolved']} resolved, "
-                     f"{v1_block['wins']}W ({v1_block['win_rate_pct']:.0f}%) "
-                     f"${v1_block['pnl_usd']:+.2f}")
-        lines.append(f"  v2_meanrev:    {v2_block['resolved']} resolved, "
-                     f"{v2_block['wins']}W ({v2_block['win_rate_pct']:.0f}%) "
-                     f"${v2_block['pnl_usd']:+.2f}")
+        if v1_block:
+            lines.append(f"  v1 (momentum): {v1_block['resolved']} resolved, "
+                         f"{v1_block['wins']}W ({v1_block['win_rate_pct']:.0f}%) "
+                         f"${v1_block['pnl_usd']:+.2f}")
+        if v2_block:
+            lines.append(f"  v2_meanrev:    {v2_block['resolved']} resolved, "
+                         f"{v2_block['wins']}W ({v2_block['win_rate_pct']:.0f}%) "
+                         f"${v2_block['pnl_usd']:+.2f}")
+        if smart_block:
+            lines.append(f"  smart_copy:    {smart_block['resolved']} resolved, "
+                         f"{smart_block['wins']}W ({smart_block['win_rate_pct']:.0f}%) "
+                         f"${smart_block['pnl_usd']:+.2f}")
+        lines.append("")
+    if smart_by_wallet:
+        lines.append("<b>By smart wallet</b>")
+        # show wallets with most copies first
+        for name, rows in sorted(smart_by_wallet.items(), key=lambda kv: -len(kv[1]))[:8]:
+            blk = _summarize(rows)
+            lines.append(f"  {name[:18]:18s} {blk['resolved']:>2}R "
+                         f"{blk['wins']}W ({blk['win_rate_pct']:.0f}%) "
+                         f"${blk['pnl_usd']:+.2f}")
         lines.append("")
     lines.append("<b>By side</b>")
     for side in ("YES", "NO"):

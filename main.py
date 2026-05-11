@@ -53,8 +53,11 @@ def polymarket_refresh_tick(notifier: Notifier):
 
 def polymarket_book_tick():
     """Snapshot YES + NO books for every market resolving in next 35 min.
-    Pre_window strategy fires at 6-30 min to resolution — 35 covers that
-    window plus a buffer for snapshot lag."""
+
+    Pre_window strategy fires at 6-30 min to resolution. Smart-money copy
+    strategy fetches books ON-DEMAND when it needs them (a tracked wallet
+    just entered a sports/politics market), so it doesn't need this tick
+    to cover long-horizon markets — that would explode the HTTP load."""
     if is_halted():
         return
     try:

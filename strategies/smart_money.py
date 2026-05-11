@@ -275,6 +275,237 @@ def refresh_tick(notifier=None) -> None:
 def poll_tick(notifier=None) -> None:
     """Poll tracked wallets and emit signals. Scheduler: interval seconds=90."""
     try:
-        poll_smart_wallets(notifier=notifier)
+        signals = poll_smart_wallets(notifier=notifier)
+        if signals:
+            n = execute_copy_trades(signals, notifier=notifier)
+            if n:
+                logger.info(f"smart_money: copied {n}/{len(signals)} signals")
     except Exception as e:
         logger.error(f"smart_money poll_tick failed: {e}")
+
+
+# ── Phase 3: copy execution ──────────────────────────────────────────────
+
+# Assumed-win-probability tiers based on smart wallet's track record.
+# Smart wallets with $5M+ lifetime aren't just lucky — assume real edge.
+# This is the prior; bounded so a single signal can't blow up Kelly sizing.
+SMART_WIN_PROB_TIERS = [
+    (10_000_000, 0.62),
+    (5_000_000,  0.58),
+    (2_000_000,  0.55),
+    (1_000_000,  0.53),
+]
+DEFAULT_SMART_WIN_PROB = 0.52
+
+# How much worse than smart wallet's avg price are we willing to pay?
+# The /positions endpoint returns avgPrice across ALL their fills, which
+# may span days. By the time we see them, the book has often moved 10-30¢.
+# Set to 0.25 — generous enough to actually fire on real signals while
+# still rejecting markets where the easy money is clearly gone.
+# Future v2: compare to most-recent /trades fill instead of avgPrice.
+MAX_PRICE_DRIFT_FROM_SMART = 0.25  # absolute, in probability units
+
+
+def _assumed_win_prob(lifetime_pnl: float) -> float:
+    for threshold, prob in SMART_WIN_PROB_TIERS:
+        if lifetime_pnl >= threshold:
+            return prob
+    return DEFAULT_SMART_WIN_PROB
+
+
+def execute_copy_trades(signals: list, notifier=None) -> int:
+    """For each SmartSignal, fire a paper copy trade if all gates pass.
+    Returns count of fires. Skipped signals are NOT errors — most signals
+    will be in markets we don't track (sports / politics) which we can't
+    trade since we don't have books for them. v2 will expand discovery."""
+    # Late imports — keep smart_money module loadable even if these are
+    # being modified by a parallel session
+    from sqlalchemy.orm import Session
+    from sqlalchemy import update
+    from datetime import datetime as _dt, timedelta as _td
+    from data.storage import engine, PolymarketMarket, PolymarketBookSnapshot, Decision
+    from execution.wallet import Wallet, record_paper_trade
+    from risk.portfolio import PortfolioGuard
+    from risk.position_sizer import size_trade
+    from models.realized_vol import estimate_sigma_per_minute, latest_btc_price
+
+    if not signals:
+        return 0
+
+    wallet = Wallet()
+    portfolio = PortfolioGuard()
+    fires = 0
+    untrackable = 0  # signals on markets we don't have in our DB
+
+    # Lazy import — heavy on first call (httpx client + gamma session)
+    from data.polymarket_client import track_market_by_condition_id
+
+    for sig in signals:
+        # 1. Do we know this market? If not, auto-add it so book_tick can
+        # start snapshotting. This is what unlocks copying SPORTS/POLITICS
+        # markets where the actual smart money lives (BTC has only 1% of
+        # tracked positions). First copy on a new market will skip with
+        # "no book" — but the next poll (90s) will have one.
+        with Session(engine) as session:
+            m = (session.query(PolymarketMarket)
+                 .filter(PolymarketMarket.condition_id == sig.condition_id)
+                 .one_or_none())
+        if m is None:
+            if track_market_by_condition_id(sig.condition_id):
+                # Re-query: it's now in our DB
+                with Session(engine) as session:
+                    m = (session.query(PolymarketMarket)
+                         .filter(PolymarketMarket.condition_id == sig.condition_id)
+                         .one_or_none())
+            if m is None:
+                untrackable += 1
+                logger.info(f"smart_money: SKIP (could not track market) "
+                             f"{sig.wallet_name}: {sig.market_title[:50]}")
+                continue
+
+        # 2. Resolves too soon?
+        now = _dt.utcnow()
+        mins_to_close = (m.resolution_ts - now).total_seconds() / 60.0
+        if mins_to_close < 2.0:
+            logger.info(f"smart_money: SKIP (resolves in {mins_to_close:.1f}min) "
+                         f"{sig.market_title[:50]}")
+            continue
+
+        # 3. Latest book — fetch on-demand if we don't have a recent snapshot.
+        # The regular polymarket_book_tick only covers markets resolving in
+        # next 35 min (BTC binaries). Sports/politics markets have longer
+        # horizons, so we have to fetch their books inline here.
+        with Session(engine) as session:
+            book = (session.query(PolymarketBookSnapshot)
+                    .filter(PolymarketBookSnapshot.condition_id == sig.condition_id)
+                    .order_by(PolymarketBookSnapshot.id.desc())
+                    .first())
+        snap_age = None
+        if book is not None and book.ts is not None:
+            snap_age = (_dt.utcnow() - book.ts).total_seconds()
+        if book is None or snap_age is None or snap_age > 120:
+            # Fetch + persist a fresh snapshot
+            try:
+                from data.polymarket_client import snapshot_market
+                snapshot_market(
+                    condition_id=sig.condition_id,
+                    yes_token=m.yes_token_id,
+                    no_token=m.no_token_id,
+                )
+                with Session(engine) as session:
+                    book = (session.query(PolymarketBookSnapshot)
+                            .filter(PolymarketBookSnapshot.condition_id == sig.condition_id)
+                            .order_by(PolymarketBookSnapshot.id.desc())
+                            .first())
+            except Exception as e:
+                logger.warning(f"smart_money: book fetch failed for "
+                                f"{sig.market_title[:40]}: {e}")
+                continue
+        if book is None or book.yes_bid is None or book.yes_ask is None:
+            logger.info(f"smart_money: SKIP (no book after fetch) {sig.market_title[:50]}")
+            continue
+
+        yes_bid = float(book.yes_bid)
+        yes_ask = float(book.yes_ask)
+        no_bid = float(book.no_bid) if book.no_bid is not None else (1.0 - yes_ask)
+        no_ask = float(book.no_ask) if book.no_ask is not None else (1.0 - yes_bid)
+        if yes_ask + no_ask > 1.05:
+            logger.info(f"smart_money: SKIP (placeholder book) {sig.market_title[:50]}")
+            continue
+
+        side = "YES" if sig.outcome.lower().startswith("y") else "NO"
+        our_ask = yes_ask if side == "YES" else no_ask
+
+        # 4. Has market run away from smart's entry?
+        if abs(our_ask - sig.current_price) > MAX_PRICE_DRIFT_FROM_SMART:
+            logger.info(f"smart_money: SKIP (price drift {sig.current_price:.3f}→"
+                         f"{our_ask:.3f}) {sig.market_title[:40]}")
+            continue
+        # 5. Tail filter — refuse lottery tickets even when smart bets them
+        if our_ask < 0.05 or our_ask > 0.95:
+            logger.info(f"smart_money: SKIP (tail {our_ask:.2f}) {sig.market_title[:40]}")
+            continue
+
+        # 6. Idempotency — already have a position on this market?
+        with Session(engine) as session:
+            existing = (session.query(Decision)
+                        .filter(Decision.condition_id == sig.condition_id,
+                                Decision.size_usd > 0,
+                                Decision.resolution_yes.is_(None))
+                        .first())
+        if existing:
+            continue
+
+        # 7. Portfolio gate
+        can, reason = portfolio.can_open(sig.condition_id)
+        if not can:
+            logger.info(f"smart_money: portfolio block — {reason}")
+            continue
+
+        # 8. Size via Kelly, using assumed win prob from smart's track record
+        win_prob = _assumed_win_prob(sig.wallet_lifetime_pnl)
+        # model_yes_prob for size_trade = our prob of YES winning
+        model_yes_prob = win_prob if side == "YES" else (1.0 - win_prob)
+        edge = (win_prob - our_ask)  # signed edge on the side we're buying
+        if edge < 0.04:
+            logger.info(f"smart_money: SKIP (edge {edge*100:+.1f}% < 4%) "
+                         f"{sig.market_title[:40]}")
+            continue
+
+        sizing = size_trade(
+            side=side,
+            model_yes_prob=model_yes_prob,
+            yes_ask=yes_ask,
+            no_ask=no_ask,
+            bankroll=wallet.available_balance(),
+        )
+        if sizing.size_usd < 1.0:
+            continue
+        final_size = round(sizing.size_usd, 2)
+
+        # 9. Fire paper trade
+        btc_now = latest_btc_price() or 0.0
+        sigma = estimate_sigma_per_minute() or 0.0001
+        decision_id = record_paper_trade(
+            condition_id=sig.condition_id,
+            side=side,
+            btc_price=float(btc_now),
+            reference_price=float(btc_now),
+            minutes_to_close=mins_to_close,
+            sigma_per_minute=sigma,
+            model_yes_prob=model_yes_prob,
+            implied_yes_prob=yes_ask if side == "YES" else 1.0 - yes_bid,
+            edge=edge if side == "YES" else -edge,
+            size_usd=final_size,
+            paid_per_unit=sizing.paid_per_unit,
+        )
+
+        # Tag: smart_copy:wallet_name|wallet_addr so summary can attribute
+        tag = f"smart_copy:{sig.wallet_name[:20]}|{sig.wallet[:12]}"
+        try:
+            with Session(engine) as session:
+                session.execute(
+                    update(Decision).where(Decision.id == decision_id).values(notes=tag)
+                )
+                session.commit()
+        except Exception as e:
+            logger.debug(f"could not tag decision: {e}")
+
+        fires += 1
+        logger.info(f"smart_money: COPIED {sig.wallet_name} → {side} "
+                     f"{sig.market_title[:35]} @ {our_ask:.3f} | size=${final_size:.2f} "
+                     f"| edge={edge*100:+.1f}% | assumed_win_prob={win_prob:.0%}")
+        if notifier:
+            notifier.send(
+                f"🐳➡️🤖 <b>COPIED {sig.wallet_name}</b>\n"
+                f"📊 {sig.market_title[:55]}\n"
+                f"➡️ {side} @ ${our_ask:.3f} | size=${final_size:.2f}\n"
+                f"💰 their position: {sig.new_size:.0f} contracts\n"
+                f"📈 assumed win prob={win_prob:.0%} | edge={edge*100:+.1f}%\n"
+                f"💡 wallet lifetime: ${sig.wallet_lifetime_pnl:,.0f}"
+            )
+
+    if untrackable:
+        logger.info(f"smart_money: {untrackable}/{len(signals)} signals on "
+                     f"markets we don't track (sports/politics — v2 task)")
+    return fires

@@ -234,6 +234,63 @@ def snapshot_market(condition_id: str, yes_token: str, no_token: str,
     }
 
 
+def track_market_by_condition_id(condition_id: str) -> bool:
+    """Ensure a market is in our DB so we can snapshot its book.
+
+    Called by smart_money strategy when it sees a tracked wallet enter a
+    market we haven't been refreshing (sports / politics / etc). We hit
+    the gamma /markets endpoint directly (not /events) so we can look up
+    a single conditionId regardless of category.
+
+    Returns True if market was added/updated, False if we couldn't resolve it.
+    """
+    try:
+        with _gamma_client() as c:
+            r = c.get(f"/markets?condition_ids={condition_id}")
+            r.raise_for_status()
+            data = r.json()
+        if not isinstance(data, list) or not data:
+            return False
+        m = data[0]
+        if m.get("closed") or m.get("archived"):
+            return False
+        # Resolution timestamp
+        end = m.get("endDate") or m.get("end_date_iso")
+        if not end:
+            return False
+        s = end.replace("Z", "+00:00") if isinstance(end, str) else end
+        try:
+            rt = datetime.fromisoformat(s).astimezone(timezone.utc).replace(tzinfo=None)
+        except Exception:
+            return False
+        if rt < datetime.utcnow():
+            return False
+        # Token IDs
+        raw = m.get("clobTokenIds")
+        if isinstance(raw, str):
+            try:
+                import json as _json
+                raw = _json.loads(raw)
+            except Exception:
+                raw = None
+        if not (isinstance(raw, list) and len(raw) >= 2):
+            return False
+        yes_tok, no_tok = str(raw[0]), str(raw[1])
+        upsert_market(
+            condition_id=condition_id,
+            question=m.get("question") or m.get("title", "")[:200],
+            resolution_ts=rt,
+            yes_token_id=yes_tok,
+            no_token_id=no_tok,
+        )
+        logger.info(f"track_market: added {condition_id[:24]}... "
+                     f"{(m.get('question') or '')[:50]}")
+        return True
+    except Exception as e:
+        logger.warning(f"track_market({condition_id[:24]}...) failed: {e}")
+        return False
+
+
 def refresh_markets(window_minutes: int = 5) -> int:
     """Pull active BTC up/down events of given window, upsert into DB."""
     events = list_btc_events(window_minutes=window_minutes)

@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     pre_window_max_minutes: int = 30
     kelly_fraction_divisor: float = 4.0       # quarter-Kelly
     max_position_pct: float = 0.05            # cap per trade at 5% bankroll
-    max_concurrent_trades: int = 3
+    max_concurrent_trades: int = 10        # smart-money copy expects 5-10 concurrent
     daily_loss_limit_pct: float = 0.20        # halt entries at -20% daily
     # Raised from 0.08 → 0.20 on 2026-05-10 so v2_meanrev has runway to
     # generate 50+ trades despite v1's $15.52 daily loss tripping the
@@ -138,11 +138,14 @@ if settings.trading_mode == "live":
             f"LIVE: clamping max_position_pct {settings.max_position_pct} → 0.05"
         )
         settings.max_position_pct = 0.05
-    if settings.max_concurrent_trades > 3:
+    # Smart-money copy strategy needs more concurrent slots (5-10) since
+    # sports/politics markets resolve in hours/days vs crypto's minutes.
+    # Clamp ceiling raised from 3 → 10 on 2026-05-11.
+    if settings.max_concurrent_trades > 10:
         logger.warning(
-            f"LIVE: clamping max_concurrent_trades {settings.max_concurrent_trades} → 3"
+            f"LIVE: clamping max_concurrent_trades {settings.max_concurrent_trades} → 10"
         )
-        settings.max_concurrent_trades = 3
+        settings.max_concurrent_trades = 10
 
 
 # Pull secrets from Secret Manager (no-op if env vars already set)

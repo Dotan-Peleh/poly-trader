@@ -41,14 +41,24 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Polymarket CTF Exchange on Polygon Mainnet
+# ── Polymarket on-chain plumbing ─────────────────────────────────────────
+# CTFExchange = order-matching engine (emits anonymous OrderFilled — no wallets)
+# ConditionalTokens = where outcome tokens live (emits TransferSingle with
+#                     `to` wallet address indexed — THIS is what we subscribe to)
 CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+CONDITIONAL_TOKENS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 
-# Actual on-chain topic hash for Polymarket CTFExchange trade events.
-# Verified by querying live logs from the contract — the keccak256 of
-# OrderFilled(bytes32,address,address,...) didn't match, so the on-chain
-# signature differs from public docs. We use the actual topic seen on chain.
-ORDER_FILLED_TOPIC = "0xbc9a2432e8aeb48327246cddd6e872ef452812b4243c04e6bfb786a2cd8faf0d"
+# TransferSingle(address indexed operator, address indexed from,
+#                address indexed to, uint256 id, uint256 value)
+# This event fires every time outcome tokens move. When a wallet BUYS via
+# the exchange, the exchange transfers tokens TO the wallet — so we filter
+# on from = CTF_EXCHANGE and read the buyer wallet out of topics[3].
+TRANSFER_SINGLE_TOPIC = "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62"
+
+# Pad an Ethereum address to a 32-byte topic-format hex string (lower)
+def _pad_address_topic(addr: str) -> str:
+    a = addr.lower().replace("0x", "")
+    return "0x" + "0" * 24 + a
 
 
 @dataclass(frozen=True)
@@ -75,79 +85,58 @@ def _decode_address(topic: str) -> str:
     return "0x" + topic[-40:]
 
 
-# PHASE 2 LIMITATION DISCOVERED 2026-05-11:
-# The CTFExchange OrderFilled event (topic 0xbc9a2432...) has 3 indexed
-# bytes32 fields (takerOrderHash, makerOrderHash, conditionId) and EMPTY
-# data. No wallet addresses. So we can detect TRADES in real-time but
-# can't immediately attribute to a wallet.
+# Phase 2.5 — subscribe to ConditionalTokens.TransferSingle.
+# When the CTFExchange fills an order, it transfers outcome tokens TO the
+# buyer's wallet. The TransferSingle event's `to` topic IS the buyer's
+# wallet address — direct attribution without needing the Polymarket API.
 #
-# Two paths forward (Phase 2.5):
-#   1. Subscribe to ConditionalTokens TransferSingle (has indexed `to`
-#      address — direct wallet identification on receipt of tokens)
-#   2. Resolve orderHash → wallet via Polymarket CLOB API /order/{hash}
+#   topics[0] = TRANSFER_SINGLE_TOPIC
+#   topics[1] = operator (indexed)  — usually the exchange itself
+#   topics[2] = from     (indexed)  — CTF_EXCHANGE when this is a trade
+#   topics[3] = to       (indexed)  — buyer wallet
+#   data      = id (uint256)  || value (uint256)
 #
-# For now polygon_stream provides on-chain trade rate sensing + heartbeat
-# but copy-execution still goes through the 30s /positions poll (which
-# DOES yield wallet attribution from data-api).
+# We filter `from = CTF_EXCHANGE` server-side to drop user-to-user
+# transfers (not trades), then check `to` against our rankings table.
 
 
 def _parse_log(log: dict) -> Optional[RealTimeSignal]:
-    """Decode an OrderFilled log entry into a RealTimeSignal.
+    """Decode a TransferSingle event into a RealTimeSignal.
 
-    The event signature:
-      OrderFilled(
-        bytes32 orderHash,
-        address indexed maker,
-        address indexed taker,
-        uint256 makerAssetId,
-        uint256 takerAssetId,
-        uint256 makerAmountFilled,
-        uint256 takerAmountFilled,
-        uint256 fee,
-      )
-    topics[0] = topic hash
-    topics[1] = maker (indexed)
-    topics[2] = taker (indexed)
-    data      = orderHash || makerAssetId || takerAssetId
-                || makerAmountFilled || takerAmountFilled || fee  (32B each)
+    Event: TransferSingle(operator, from, to, id, value) all indexed up to to.
+      topics[0] = TRANSFER_SINGLE_TOPIC
+      topics[1] = operator (indexed address — usually exchange)
+      topics[2] = from     (indexed address — CTF_EXCHANGE when this is a buy)
+      topics[3] = to       (indexed address — buyer wallet)
+      data      = id (uint256, 32B) || value (uint256, 32B)
     """
     try:
-        topics = log["topics"]
-        if len(topics) < 3 or topics[0].lower() != ORDER_FILLED_TOPIC:
+        topics = log.get("topics") or []
+        if len(topics) < 4 or topics[0].lower() != TRANSFER_SINGLE_TOPIC:
             return None
-        maker = _decode_address(topics[1])
-        taker = _decode_address(topics[2])
-        data = log["data"]
+        from_addr = _decode_address(topics[2]).lower()
+        # Only count transfers FROM the exchange (= trades). Skip user-to-user.
+        if from_addr != CTF_EXCHANGE.lower():
+            return None
+        to_addr = _decode_address(topics[3]).lower()
+        data = log.get("data", "")
         if data.startswith("0x"):
             data = data[2:]
-        # 6 × 32 bytes = 384 hex chars
-        if len(data) < 384:
+        if len(data) < 128:
             return None
-        order_hash = "0x" + data[0:64]
-        maker_asset_id = _decode_uint(data[64:128])
-        taker_asset_id = _decode_uint(data[128:192])
-        maker_amount = _decode_uint(data[192:256])
-        taker_amount = _decode_uint(data[256:320])
-        # fee = _decode_uint(data[320:384])
-
-        # Polymarket convention: in a BUY of a token, taker is the buyer;
-        # taker pays USDC (makerAmount = USDC, 6 decimals), receives the
-        # outcome token (takerAmount).
-        # We treat 'wallet' as the taker (the entry side we care about).
-        # In a SELL the same person could be maker; for now we track both
-        # and the upstream filter decides.
-        usdc = maker_amount / 1_000_000.0
-        tokens = taker_amount / 1_000_000.0
-        if tokens <= 0:
+        token_id = _decode_uint(data[0:64])
+        value = _decode_uint(data[64:128])
+        # ConditionalTokens use 6 decimals
+        amount = value / 1_000_000.0
+        if amount <= 0:
             return None
-        price = usdc / tokens
         return RealTimeSignal(
-            wallet=taker.lower(),
-            maker=maker.lower(),
-            asset_id=str(taker_asset_id),
+            wallet=to_addr,           # the BUYER
+            maker=from_addr,          # CTF_EXCHANGE
+            asset_id=str(token_id),
             side="BUY",
-            amount_filled=tokens,
-            price=price,
+            amount_filled=amount,
+            price=0.0,                # not in this event — look up book separately
             block_number=_decode_uint(log["blockNumber"]),
             tx_hash=log["transactionHash"],
             log_index=_decode_uint(log["logIndex"]),
@@ -165,12 +154,19 @@ async def _ws_loop(api_key: str, on_signal):
     import websockets  # lazy import — only needed when stream runs
     url = f"wss://polygon-mainnet.g.alchemy.com/v2/{api_key}"
     async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
-        # Subscribe to logs from CTF Exchange with the OrderFilled topic
+        # Subscribe to ConditionalTokens TransferSingle events where
+        # from = CTF_EXCHANGE (= buy fills). The `to` topic IS the buyer's
+        # wallet, so we get direct attribution without API calls.
         sub_req = {
             "jsonrpc": "2.0", "id": 1, "method": "eth_subscribe",
             "params": ["logs", {
-                "address": CTF_EXCHANGE,
-                "topics": [ORDER_FILLED_TOPIC],
+                "address": CONDITIONAL_TOKENS,
+                "topics": [
+                    TRANSFER_SINGLE_TOPIC,
+                    None,                                  # operator (any)
+                    _pad_address_topic(CTF_EXCHANGE),      # from = exchange
+                    # to filter is None — we want all buyers, then post-match
+                ],
             }],
         }
         await ws.send(json.dumps(sub_req))
@@ -179,7 +175,8 @@ async def _ws_loop(api_key: str, on_signal):
             logger.error(f"polygon_stream: subscribe failed: {ack}")
             return
         sub_id = ack["result"]
-        logger.info(f"polygon_stream: subscribed to OrderFilled (sub_id={sub_id})")
+        logger.info(f"polygon_stream: subscribed to TransferSingle "
+                     f"from CTFExchange (sub_id={sub_id})")
 
         while True:
             msg = json.loads(await ws.recv())

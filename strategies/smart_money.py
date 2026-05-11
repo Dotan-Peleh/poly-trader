@@ -319,19 +319,11 @@ def poll_smart_wallets(notifier=None):
 
     _save_snapshots(snaps)
 
-    if entry_signals and notifier is not None:
-        for s in entry_signals[:5]:
-            age_str = ""
-            if s.last_fill_ts:
-                age_min = (datetime.now(timezone.utc).timestamp() - s.last_fill_ts) / 60
-                age_str = f" (filled {age_min:.0f}m ago)"
-            notifier.send(
-                f"🐳 <b>SMART MONEY</b> entered\n"
-                f"👤 {s.wallet_name} (lifetime ${s.wallet_lifetime_pnl:,.0f})\n"
-                f"📊 {s.market_title[:60]}\n"
-                f"➡️  {s.outcome} @ ${s.current_price:.3f} | size={s.new_size:.0f} "
-                f"(+{s.delta_size:.0f}){age_str}"
-            )
+    # Note: we deliberately do NOT Telegram-ping every detected entry signal.
+    # Most signals get filtered out (price drift, stale entry, edge gate, etc)
+    # and only ~10% become actual copies. User only wants to see real
+    # BUY (COPIED) and SELL (CLOSED COPY) events — those are sent by
+    # execute_copy_trades and execute_copy_exits respectively.
 
     if entry_signals or exit_signals:
         logger.info(f"smart_money: {len(entry_signals)} new entries + "

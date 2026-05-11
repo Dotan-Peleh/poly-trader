@@ -44,7 +44,18 @@ SNAPSHOT_PATH = "/home/dotanwork/poly-trader/var/smart_wallet_positions.json"
 # Smart-wallet selection thresholds (used by refresh_smart_wallets)
 MIN_LIFETIME_PNL = 1_000_000
 MAX_DAYS_SINCE_LAST_TRADE = 14
-TARGET_WALLET_COUNT = 30
+TARGET_WALLET_COUNT = 50               # raised from 30 — more scanning surface
+
+# Phase 4 exit thresholds
+EXIT_REDUCTION_THRESHOLD = 0.30        # if smart wallet drops position size by
+                                        # ≥30%, treat as exit signal and close
+                                        # OUR copy 100%. Faster than waiting for
+                                        # full close — the goal is to get out
+                                        # BEFORE they finish dumping.
+STALE_ENTRY_MAX_AGE_MIN = 15           # don't copy a smart-money entry that's
+                                        # already > 15 min old. By then the
+                                        # easy edge is gone and other copy bots
+                                        # are likely already in.
 
 
 # ── HTTP helper ──────────────────────────────────────────────────────────
@@ -64,7 +75,9 @@ def refresh_smart_wallets() -> List[dict]:
     Returns the list of wallets selected.
     """
     try:
-        top = _get_json(f"{LB_API}/profit?window=All&limit=200")
+        # Top 500 by all-time profit. After filtering to wallets that
+        # traded in last 14 days we typically keep 30-50 active wallets.
+        top = _get_json(f"{LB_API}/profit?window=All&limit=500")
     except Exception as e:
         logger.error(f"smart_money: leaderboard fetch failed: {e}")
         return []
@@ -140,8 +153,48 @@ class SmartSignal:
     outcome: str         # "Yes" / "No" — which side they bet
     new_size: float      # current size of their position
     delta_size: float    # how much it grew vs previous snapshot
-    current_price: float
+    current_price: float  # smart wallet's avg price (across all fills)
+    last_fill_price: Optional[float]  # most-recent fill (best proxy for entry now)
+    last_fill_ts: Optional[float]     # unix seconds — for stale-entry filter
     detected_at: str
+
+
+@dataclass
+class SmartExitSignal:
+    """Emitted when a tracked wallet reduces position by ≥ EXIT_REDUCTION_THRESHOLD.
+    Triggers close of our matching copy position."""
+    wallet: str
+    wallet_name: str
+    condition_id: str
+    market_title: str
+    outcome: str            # side they HAD (we should be on the same side if we copied)
+    prev_size: float
+    new_size: float
+    reduction_pct: float    # 0.30 = 30% reduction
+    detected_at: str
+
+
+def _fetch_last_trade(wallet: str, asset_id: str) -> tuple:
+    """Most-recent fill (price, timestamp) for this wallet on this specific
+    asset (token_id). Returns (None, None) if not found.
+
+    This is more accurate than the avgPrice from /positions because it
+    reflects what they paid moments ago, not their lifetime average.
+    """
+    try:
+        # Hit /trades?user=X&limit=20 and filter to this asset
+        trades = _get_json(f"{DATA_API}/trades?user={wallet}&limit=20", timeout=8)
+        if not isinstance(trades, list):
+            return (None, None)
+        for t in trades:
+            if t.get("asset") != asset_id:
+                continue
+            if (t.get("side") or "").upper() != "BUY":
+                continue
+            return (float(t.get("price") or 0), float(t.get("timestamp") or 0))
+    except Exception as e:
+        logger.debug(f"_fetch_last_trade({wallet[:12]}, {asset_id[:8]}): {e}")
+    return (None, None)
 
 
 def _load_snapshots() -> Dict[str, dict]:
@@ -162,19 +215,21 @@ def _save_snapshots(snaps: Dict[str, dict]) -> None:
     os.replace(tmp, SNAPSHOT_PATH)
 
 
-def poll_smart_wallets(notifier=None) -> List[SmartSignal]:
-    """Pull /positions for each tracked wallet, diff against previous
-    snapshot, emit SmartSignal for new opens / size growth.
+def poll_smart_wallets(notifier=None):
+    """Pull /positions for each tracked wallet, diff against previous snapshot.
+    Emits two kinds of signals:
+      • SmartSignal     — new open / grew ≥ 10% — for Phase 3 (copy entry)
+      • SmartExitSignal — reduced ≥ EXIT_REDUCTION_THRESHOLD — for Phase 4
 
-    Run from scheduler every 60–120s. Returns list of signals (also
-    persisted in DB by the copy-execution path if wired)."""
+    Returns (entry_signals, exit_signals)."""
     wallets = _load_wallet_list()
     if not wallets:
         logger.info("smart_money: no wallet list (run refresh_smart_wallets first)")
-        return []
+        return [], []
 
     snaps = _load_snapshots()
-    signals: List[SmartSignal] = []
+    entry_signals: List[SmartSignal] = []
+    exit_signals: List[SmartExitSignal] = []
 
     for w in wallets:
         wallet = w["wallet"]
@@ -187,7 +242,7 @@ def poll_smart_wallets(notifier=None) -> List[SmartSignal]:
         if not isinstance(pos, list):
             continue
 
-        # Build current state: {asset_id: {size, price, market_title, outcome, condition_id}}
+        # Build current state
         cur = {}
         for p in pos:
             asset = p.get("asset") or ""
@@ -204,13 +259,14 @@ def poll_smart_wallets(notifier=None) -> List[SmartSignal]:
 
         prev = snaps.get(wallet, {}).get("positions", {})
 
-        # Emit signals for NEW assets or grown sizes
+        # ── Detect NEW OPENS / GROWTH (Phase 3 entry signals) ──
         for asset, info in cur.items():
             prev_size = float(prev.get(asset, {}).get("size") or 0)
             delta = info["size"] - prev_size
             if delta > 0 and (prev_size == 0 or delta / max(prev_size, 1) > 0.10):
-                # New position OR grew by >10%
-                signals.append(SmartSignal(
+                # Fetch latest fill price + timestamp for accurate copy
+                last_price, last_ts = _fetch_last_trade(wallet, asset)
+                entry_signals.append(SmartSignal(
                     wallet=wallet,
                     wallet_name=w["name"],
                     wallet_lifetime_pnl=w["lifetime_pnl"],
@@ -221,18 +277,37 @@ def poll_smart_wallets(notifier=None) -> List[SmartSignal]:
                     new_size=info["size"],
                     delta_size=delta,
                     current_price=info["price"],
+                    last_fill_price=last_price,
+                    last_fill_ts=last_ts,
                     detected_at=datetime.now(timezone.utc).isoformat(),
                 ))
 
-        # Detect EXITS (asset present in prev, gone or shrunk in cur) — for Phase 4
+        # ── Detect EXITS / REDUCTIONS (Phase 4 exit signals) ──
+        # We compute fraction reduced from PREV. If position size dropped by
+        # at least EXIT_REDUCTION_THRESHOLD, signal copy-exit. Catches the
+        # FIRST sign of unwind, not waiting for full close.
         for asset, prev_info in prev.items():
             prev_size = float(prev_info.get("size") or 0)
             new_size = float(cur.get(asset, {}).get("size") or 0)
-            if prev_size > 0 and new_size < prev_size * 0.5:
+            if prev_size <= 0:
+                continue
+            reduction = (prev_size - new_size) / prev_size
+            if reduction >= EXIT_REDUCTION_THRESHOLD:
+                exit_signals.append(SmartExitSignal(
+                    wallet=wallet,
+                    wallet_name=w["name"],
+                    condition_id=prev_info.get("condition_id", ""),
+                    market_title=prev_info.get("market_title", ""),
+                    outcome=prev_info.get("outcome", ""),
+                    prev_size=prev_size,
+                    new_size=new_size,
+                    reduction_pct=reduction,
+                    detected_at=datetime.now(timezone.utc).isoformat(),
+                ))
                 logger.info(f"smart_money: SMART EXIT {w['name']} "
-                             f"{prev_info.get('market_title','?')[:50]} "
-                             f"{prev_size:.0f}→{new_size:.0f}")
-                # Phase 4 will hook here to close our matching copy
+                             f"{prev_info.get('market_title','?')[:45]} "
+                             f"{prev_size:.0f}→{new_size:.0f} "
+                             f"(-{reduction*100:.0f}%)")
 
         snaps[wallet] = {
             "name": w["name"],
@@ -240,24 +315,28 @@ def poll_smart_wallets(notifier=None) -> List[SmartSignal]:
             "last_polled": datetime.now(timezone.utc).isoformat(),
         }
 
-        time.sleep(0.1)  # be polite to the API
+        time.sleep(0.05)  # be polite to API but faster than before
 
     _save_snapshots(snaps)
 
-    # Notify on first emit per signal (the calling copy-executor decides actual fires)
-    if signals and notifier is not None:
-        for s in signals[:5]:  # cap noise to 5 per tick
+    if entry_signals and notifier is not None:
+        for s in entry_signals[:5]:
+            age_str = ""
+            if s.last_fill_ts:
+                age_min = (datetime.now(timezone.utc).timestamp() - s.last_fill_ts) / 60
+                age_str = f" (filled {age_min:.0f}m ago)"
             notifier.send(
                 f"🐳 <b>SMART MONEY</b> entered\n"
                 f"👤 {s.wallet_name} (lifetime ${s.wallet_lifetime_pnl:,.0f})\n"
                 f"📊 {s.market_title[:60]}\n"
                 f"➡️  {s.outcome} @ ${s.current_price:.3f} | size={s.new_size:.0f} "
-                f"(+{s.delta_size:.0f})"
+                f"(+{s.delta_size:.0f}){age_str}"
             )
 
-    if signals:
-        logger.info(f"smart_money: {len(signals)} new signals from {len(wallets)} wallets")
-    return signals
+    if entry_signals or exit_signals:
+        logger.info(f"smart_money: {len(entry_signals)} new entries + "
+                     f"{len(exit_signals)} exits from {len(wallets)} wallets")
+    return entry_signals, exit_signals
 
 
 # ── Scheduler entrypoints ────────────────────────────────────────────────
@@ -273,13 +352,18 @@ def refresh_tick(notifier=None) -> None:
 
 
 def poll_tick(notifier=None) -> None:
-    """Poll tracked wallets and emit signals. Scheduler: interval seconds=90."""
+    """Poll tracked wallets and act on signals. Scheduler: interval seconds=30."""
     try:
-        signals = poll_smart_wallets(notifier=notifier)
-        if signals:
-            n = execute_copy_trades(signals, notifier=notifier)
+        entry_signals, exit_signals = poll_smart_wallets(notifier=notifier)
+        if exit_signals:
+            # Process exits FIRST — we want to free capital before entering new positions
+            n = execute_copy_exits(exit_signals, notifier=notifier)
             if n:
-                logger.info(f"smart_money: copied {n}/{len(signals)} signals")
+                logger.info(f"smart_money: exited {n}/{len(exit_signals)} smart-exit signals")
+        if entry_signals:
+            n = execute_copy_trades(entry_signals, notifier=notifier)
+            if n:
+                logger.info(f"smart_money: copied {n}/{len(entry_signals)} entry signals")
     except Exception as e:
         logger.error(f"smart_money poll_tick failed: {e}")
 
@@ -341,11 +425,21 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
     from data.polymarket_client import track_market_by_condition_id
 
     for sig in signals:
+        # 0. STALE-ENTRY FILTER — don't copy yesterday's news.
+        # Only fire if smart wallet's most-recent buy on this asset is
+        # within STALE_ENTRY_MAX_AGE_MIN. Other copy bots watch too; if
+        # their fill is > 15 min old we're racing into a worse price.
+        if sig.last_fill_ts:
+            age_min = (_dt.utcnow().timestamp() - sig.last_fill_ts) / 60.0
+            if age_min > STALE_ENTRY_MAX_AGE_MIN:
+                logger.info(f"smart_money: SKIP (entry {age_min:.0f}m old > "
+                             f"{STALE_ENTRY_MAX_AGE_MIN}m) {sig.market_title[:40]}")
+                continue
+
         # 1. Do we know this market? If not, auto-add it so book_tick can
         # start snapshotting. This is what unlocks copying SPORTS/POLITICS
-        # markets where the actual smart money lives (BTC has only 1% of
-        # tracked positions). First copy on a new market will skip with
-        # "no book" — but the next poll (90s) will have one.
+        # markets where the actual smart money lives. First copy on a new
+        # market will skip with "no book" — but the next 30s poll has one.
         with Session(engine) as session:
             m = (session.query(PolymarketMarket)
                  .filter(PolymarketMarket.condition_id == sig.condition_id)
@@ -417,8 +511,11 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
         our_ask = yes_ask if side == "YES" else no_ask
 
         # 4. Has market run away from smart's entry?
-        if abs(our_ask - sig.current_price) > MAX_PRICE_DRIFT_FROM_SMART:
-            logger.info(f"smart_money: SKIP (price drift {sig.current_price:.3f}→"
+        # Prefer last_fill_price (their actual recent buy) over current_price
+        # (avgPrice across all fills — can be misleading on scaled-in positions).
+        ref_price = sig.last_fill_price if sig.last_fill_price else sig.current_price
+        if abs(our_ask - ref_price) > MAX_PRICE_DRIFT_FROM_SMART:
+            logger.info(f"smart_money: SKIP (price drift {ref_price:.3f}→"
                          f"{our_ask:.3f}) {sig.market_title[:40]}")
             continue
         # 5. Tail filter — refuse lottery tickets even when smart bets them
@@ -509,3 +606,96 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
         logger.info(f"smart_money: {untrackable}/{len(signals)} signals on "
                      f"markets we don't track (sports/politics — v2 task)")
     return fires
+
+
+# ── Phase 4: copy-exit execution ─────────────────────────────────────────
+
+def execute_copy_exits(exit_signals: list, notifier=None) -> int:
+    """For each SmartExitSignal, find our matching open smart_copy position
+    on the same market AND same side, close it at current book.
+
+    The principle: when a tracked smart wallet starts unwinding (≥30%
+    reduction), close OUR copy fully. They typically scale out over a few
+    minutes — closing 100% now puts us out before the price moves further
+    against the position they're dumping.
+    """
+    from sqlalchemy.orm import Session
+    from sqlalchemy import update
+    from datetime import datetime as _dt
+    from data.storage import engine, PolymarketBookSnapshot, Decision
+
+    if not exit_signals:
+        return 0
+
+    closed = 0
+    for sig in exit_signals:
+        # Find our matching open copy. Match on condition_id AND that the
+        # current notes contain smart_copy: (we don't constrain on side
+        # since smart wallet could change sides; just close whatever we have).
+        with Session(engine) as session:
+            our_pos = (session.query(Decision)
+                       .filter(Decision.condition_id == sig.condition_id,
+                               Decision.size_usd > 0,
+                               Decision.resolution_yes.is_(None),
+                               Decision.notes.like("%smart_copy%"))
+                       .order_by(Decision.id.desc())
+                       .first())
+        if our_pos is None:
+            continue  # we don't have a copy on this market — nothing to close
+
+        # Get current book mid for the exit price
+        with Session(engine) as session:
+            book = (session.query(PolymarketBookSnapshot)
+                    .filter(PolymarketBookSnapshot.condition_id == sig.condition_id)
+                    .order_by(PolymarketBookSnapshot.id.desc())
+                    .first())
+        if book is None or book.yes_bid is None or book.yes_ask is None:
+            # No book — try fetching one
+            try:
+                from data.polymarket_client import snapshot_market
+                from data.storage import PolymarketMarket
+                with Session(engine) as session:
+                    m = (session.query(PolymarketMarket)
+                         .filter(PolymarketMarket.condition_id == sig.condition_id)
+                         .one_or_none())
+                if m is None:
+                    logger.warning(f"smart_money: can't close — no market record "
+                                    f"for {sig.market_title[:40]}")
+                    continue
+                snapshot_market(condition_id=sig.condition_id,
+                                yes_token=m.yes_token_id, no_token=m.no_token_id)
+                with Session(engine) as session:
+                    book = (session.query(PolymarketBookSnapshot)
+                            .filter(PolymarketBookSnapshot.condition_id == sig.condition_id)
+                            .order_by(PolymarketBookSnapshot.id.desc())
+                            .first())
+            except Exception as e:
+                logger.warning(f"smart_money: book fetch for close failed: {e}")
+                continue
+        if book is None or book.yes_bid is None or book.yes_ask is None:
+            continue
+
+        # Use the BID for our side (we're selling — we get hit at the bid)
+        yes_mid = (float(book.yes_bid) + float(book.yes_ask)) / 2.0
+        # _resolve_paper_at_mid already handles YES vs NO accounting via side
+        # column — we just pass the YES-mid and it converts.
+        from strategies.exit_manager import _resolve_paper_at_mid
+        reason = f"smart_exit:{sig.wallet_name[:18]}_{int(sig.reduction_pct*100)}pct"
+        result = _resolve_paper_at_mid(our_pos.id, yes_mid, reason)
+        if result is None:
+            continue
+        closed += 1
+        logger.info(f"smart_money: CLOSED COPY {sig.wallet_name} dumped → "
+                     f"{sig.market_title[:35]} | our pnl=${result.get('pnl_usd', 0):+.2f}")
+        if notifier:
+            pnl = result.get("pnl_usd", 0)
+            icon = "✅" if pnl > 0 else "🔴"
+            notifier.send(
+                f"🐳⬅️🤖 <b>SMART EXIT — CLOSED COPY</b>\n"
+                f"👤 {sig.wallet_name} reduced {sig.prev_size:.0f}→{sig.new_size:.0f} "
+                f"(-{sig.reduction_pct*100:.0f}%)\n"
+                f"📊 {sig.market_title[:55]}\n"
+                f"{icon} our P&amp;L: <b>${pnl:+.2f}</b>"
+            )
+
+    return closed

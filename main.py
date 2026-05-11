@@ -268,9 +268,11 @@ def main():
     scheduler.add_job(smart_refresh_tick, "cron", hour="*/12", minute=5,
                        args=[notifier], id="smart_money_refresh",
                        coalesce=True, max_instances=1, misfire_grace_time=600)
-    scheduler.add_job(smart_poll_tick, "interval", seconds=90,
+    # 30s poll for amazing real-time scanning — 3x faster than 90s baseline,
+    # gets us out of positions BEFORE other copy bots even detect the exit
+    scheduler.add_job(smart_poll_tick, "interval", seconds=30,
                        args=[notifier], id="smart_money_poll",
-                       coalesce=True, max_instances=1, misfire_grace_time=120)
+                       coalesce=True, max_instances=1, misfire_grace_time=60)
     scheduler.start()
     logger.info("Scheduler started")
 

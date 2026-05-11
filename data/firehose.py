@@ -69,6 +69,24 @@ class SmartWalletRanking(Base):
     pseudonym = Column(String(80))
 
 
+class PolygonStreamHit(Base):
+    """Every on-chain trade by a tracked smart wallet (via TransferSingle).
+    Written from polygon_stream's signal handler. Capped at last 500 rows by
+    the prune job — keeps the dashboard's view manageable + DB compact."""
+    __tablename__ = "polygon_stream_hits"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    detected_at = Column(BigInteger, nullable=False, index=True)
+    wallet = Column(String(80), nullable=False, index=True)
+    pseudonym = Column(String(80))
+    lifetime_pnl = Column(Float)
+    asset_id = Column(String(80))
+    amount = Column(Float)
+    tx_hash = Column(String(80))
+    block_number = Column(BigInteger)
+    market_title = Column(Text)            # filled by lookup if available
+    fired_copy = Column(Integer, default=0)  # 1 if this hit triggered a copy
+
+
 # ── HTTP helper ──────────────────────────────────────────────────────────
 
 def _get_json(url: str, timeout: float = 10.0):
@@ -82,6 +100,82 @@ def _get_json(url: str, timeout: float = 10.0):
 def init_firehose_schema(engine) -> None:
     """Create firehose tables if they don't exist. Safe to call repeatedly."""
     Base.metadata.create_all(engine)
+
+
+def prune_old_rows(engine, keep_hours: int = 24, vacuum: bool = True) -> dict:
+    """Delete trades_firehose rows older than keep_hours + polygon_stream_hits
+    older than keep_hours, then VACUUM to reclaim space. Without this the
+    DB grows unboundedly (1M+ trades/day × 250 B = ~250 MB/day) which
+    breaks the GCS sync the dashboard depends on.
+
+    Returns counts of pruned rows + final DB size.
+    """
+    cutoff_ts = int(time.time()) - keep_hours * 3600
+    # btc_ticks are stored with `ts` as a SQLite DATETIME — convert
+    cutoff_dt = datetime.utcfromtimestamp(cutoff_ts).strftime("%Y-%m-%d %H:%M:%S")
+    btc_cutoff_ts = int(time.time()) - 6 * 3600  # btc_ticks: only keep 6h
+    btc_cutoff_dt = datetime.utcfromtimestamp(btc_cutoff_ts).strftime("%Y-%m-%d %H:%M:%S")
+
+    with Session(engine) as session:
+        fh_pruned = session.execute(sql_text(
+            "DELETE FROM trades_firehose WHERE ts < :cutoff"
+        ), {"cutoff": cutoff_ts}).rowcount
+        # btc_ticks → keep just 6h (vol estimator uses 30-min window)
+        btc_pruned = session.execute(sql_text(
+            "DELETE FROM btc_ticks WHERE ts < :cutoff"
+        ), {"cutoff": btc_cutoff_dt}).rowcount
+        # polymarket_book_snapshots → keep 24h
+        book_pruned = session.execute(sql_text(
+            "DELETE FROM polymarket_book_snapshots WHERE ts < :cutoff"
+        ), {"cutoff": cutoff_dt}).rowcount
+        # Stream hits: keep last 500 by id
+        session.execute(sql_text("""
+            DELETE FROM polygon_stream_hits
+            WHERE id NOT IN (
+              SELECT id FROM polygon_stream_hits ORDER BY id DESC LIMIT 500
+            )
+        """))
+        session.commit()
+    if vacuum:
+        try:
+            with engine.connect() as conn:
+                conn.execute(sql_text("VACUUM"))
+        except Exception as e:
+            logger.warning(f"firehose: vacuum failed: {e}")
+    # Report final size
+    db_path = str(engine.url).replace("sqlite:///", "")
+    try:
+        import os as _os
+        size_mb = _os.path.getsize(db_path) / 1_000_000.0
+    except Exception:
+        size_mb = -1
+    logger.info(f"firehose: pruned {fh_pruned} trades + {btc_pruned} btc_ticks "
+                 f"+ {book_pruned} books, db now {size_mb:.1f} MB")
+    return {"trades_pruned": fh_pruned, "btc_pruned": btc_pruned,
+            "books_pruned": book_pruned, "db_size_mb": size_mb}
+
+
+def record_stream_hit(engine, wallet: str, pseudonym: str,
+                       lifetime_pnl: float, asset_id: str, amount: float,
+                       tx_hash: str, block_number: int,
+                       market_title: str = "", fired_copy: bool = False) -> None:
+    """Insert a row into polygon_stream_hits for dashboard visibility."""
+    try:
+        with Session(engine) as session:
+            session.execute(sql_text("""
+                INSERT INTO polygon_stream_hits
+                  (detected_at, wallet, pseudonym, lifetime_pnl, asset_id,
+                   amount, tx_hash, block_number, market_title, fired_copy)
+                VALUES (:t, :w, :p, :l, :a, :amt, :tx, :b, :m, :f)
+            """), {
+                "t": int(time.time()), "w": wallet, "p": pseudonym,
+                "l": lifetime_pnl, "a": asset_id, "amt": amount,
+                "tx": tx_hash, "b": block_number, "m": market_title,
+                "f": 1 if fired_copy else 0,
+            })
+            session.commit()
+    except Exception as e:
+        logger.debug(f"firehose: record_stream_hit failed: {e}")
 
 
 def _last_ingested_api_id(engine) -> Optional[str]:

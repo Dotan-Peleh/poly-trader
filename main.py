@@ -243,16 +243,15 @@ def main():
             def _on_realtime_signal(sig):
                 import time as _tm
                 _stream_stats["events"] += 1
-                # Heartbeat: every 100 events OR every 5 min, whichever first
-                if (_stream_stats["events"] % 100 == 0
+                # Heartbeat
+                if (_stream_stats["events"] % 500 == 0
                     or _tm.time() - _stream_stats["last_log"] > 300):
                     logger.info(
                         f"polygon_stream: heartbeat — "
-                        f"{_stream_stats['events']} events seen, "
-                        f"{_stream_stats['tracked_hits']} tracked-wallet hits"
+                        f"{_stream_stats['events']} events, "
+                        f"{_stream_stats['tracked_hits']} hits"
                     )
                     _stream_stats["last_log"] = _tm.time()
-                # Match against rankings table
                 try:
                     from sqlalchemy.orm import Session
                     from sqlalchemy import text as _t
@@ -265,13 +264,81 @@ def main():
                     if not row:
                         return  # not on our radar
                     _stream_stats["tracked_hits"] += 1
+                    pseudonym = row[0] or "anon"
+                    lifetime = float(row[1] or 0)
                     logger.info(
-                        f"polygon_stream: ⚡ TRACKED WALLET {sig.wallet[:12]} "
-                        f"({row[0] or 'anon'}, lifetime ${row[1] or 0:,.0f}) "
-                        f"@ {sig.price:.3f} × {sig.amount_filled:.0f} "
-                        f"block {sig.block_number}"
+                        f"polygon_stream: ⚡ {sig.wallet[:12]} ({pseudonym}, "
+                        f"${lifetime:,.0f}) × {sig.amount_filled:.0f} block {sig.block_number}"
                     )
-                    # Phase 2.5 — wire to copy executor here.
+                    # Phase 3: trigger immediate copy via the same path the
+                    # 30s poll uses. We construct a SmartSignal and dispatch
+                    # to execute_copy_trades synchronously here. This drops
+                    # entry latency from ~30s to <2s.
+                    fired = False
+                    try:
+                        from strategies.smart_money import (
+                            SmartSignal, execute_copy_trades,
+                        )
+                        # We don't have condition_id from the stream event
+                        # directly — but we DO have the asset_id (token_id).
+                        # Look up condition_id from polymarket_markets table.
+                        with Session(_eng) as s:
+                            mrow = s.execute(_t(
+                                "SELECT condition_id, question FROM polymarket_markets "
+                                "WHERE yes_token_id = :a OR no_token_id = :a"
+                            ), {"a": sig.asset_id}).first()
+                        if mrow is None:
+                            # Market not in our DB yet — let the 30s poll
+                            # path handle it (it auto-adds via gamma API)
+                            return
+                        cid, title = mrow[0], mrow[1] or ""
+                        # Determine outcome side: yes or no
+                        with Session(_eng) as s:
+                            yrow = s.execute(_t(
+                                "SELECT yes_token_id FROM polymarket_markets "
+                                "WHERE condition_id = :c"
+                            ), {"c": cid}).first()
+                        outcome = "Yes" if yrow and yrow[0] == sig.asset_id else "No"
+                        # Build SmartSignal mirroring the structure
+                        from datetime import datetime as _dt, timezone as _tz
+                        ss = SmartSignal(
+                            wallet=sig.wallet,
+                            wallet_name=pseudonym,
+                            wallet_lifetime_pnl=lifetime,
+                            condition_id=cid,
+                            asset_id=sig.asset_id,
+                            market_title=title,
+                            outcome=outcome,
+                            new_size=sig.amount_filled,
+                            delta_size=sig.amount_filled,  # treat stream hit
+                                                            # as a delta event
+                            current_price=0.0,             # not in stream
+                            last_fill_price=None,          # let drift check
+                                                            # pull from book
+                            last_fill_ts=sig.received_at,
+                            detected_at=_dt.now(_tz.utc).isoformat(),
+                        )
+                        n = execute_copy_trades([ss], notifier=notifier)
+                        if n:
+                            fired = True
+                            logger.info(
+                                f"polygon_stream: ⚡⚡ INSTANT COPY fired "
+                                f"({pseudonym} @ block {sig.block_number})"
+                            )
+                    except Exception as e:
+                        logger.warning(f"polygon_stream copy attempt: {e}")
+                    # Record stream hit for dashboard visibility
+                    try:
+                        from data.firehose import record_stream_hit
+                        record_stream_hit(
+                            _eng, wallet=sig.wallet, pseudonym=pseudonym,
+                            lifetime_pnl=lifetime, asset_id=sig.asset_id,
+                            amount=sig.amount_filled, tx_hash=sig.tx_hash,
+                            block_number=sig.block_number,
+                            fired_copy=fired,
+                        )
+                    except Exception as e:
+                        logger.debug(f"polygon_stream record_hit: {e}")
                 except Exception as e:
                     logger.warning(f"polygon_stream signal handler: {e}")
 
@@ -366,6 +433,19 @@ def main():
     scheduler.add_job(_firehose_rank, "cron", minute="*/15",
                        id="firehose_rank",
                        coalesce=True, max_instances=1, misfire_grace_time=600)
+    # Prune firehose trades older than 24h every hour + VACUUM the DB.
+    # Critical for keeping poly.db under ~200MB so the GCS sync (1/min)
+    # completes within its budget — without this the DB grew to 600MB
+    # and dashboard data went 50min stale.
+    def _firehose_prune():
+        try:
+            from data.firehose import prune_old_rows
+            prune_old_rows(_engine, keep_hours=24, vacuum=True)
+        except Exception as e:
+            logger.error(f"firehose prune failed: {e}")
+    scheduler.add_job(_firehose_prune, "cron", minute=7,
+                       id="firehose_prune",
+                       coalesce=True, max_instances=1, misfire_grace_time=300)
     scheduler.start()
     logger.info("Scheduler started")
 

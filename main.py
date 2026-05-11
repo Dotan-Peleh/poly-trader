@@ -273,6 +273,44 @@ def main():
     scheduler.add_job(smart_poll_tick, "interval", seconds=30,
                        args=[notifier], id="smart_money_poll",
                        coalesce=True, max_instances=1, misfire_grace_time=60)
+    # ─── Phase 1: Trade firehose ─────────────────────────────────────
+    # Polls Polymarket's /trades endpoint every 2s and captures EVERY
+    # trade across the platform — not just our 18 hardcoded whales.
+    # Then ranks the wallet universe every 5 min to dynamically promote
+    # newly-emerged smart money. Phase 2 will replace polling with
+    # Polygon RPC WebSocket via Alchemy for <1s latency.
+    from data.firehose import (
+        init_firehose_schema, ingest_tick as firehose_ingest_tick,
+        rank_wallets_from_firehose,
+    )
+    from data.storage import engine as _engine
+    init_firehose_schema(_engine)
+
+    def _firehose_ingest():
+        try:
+            n = firehose_ingest_tick(_engine)
+            if n:
+                logger.debug(f"firehose: +{n} trades")
+        except Exception as e:
+            logger.warning(f"firehose ingest failed: {e}")
+
+    def _firehose_rank():
+        try:
+            n = rank_wallets_from_firehose(_engine, lookback_days=7, top_n=500)
+            if n:
+                logger.info(f"firehose: ranked {n} smart wallets (top 500)")
+        except Exception as e:
+            logger.error(f"firehose rank failed: {e}")
+
+    # /trades has a ~5-min processing lag (cache or indexer delay) — polling
+    # at 2s is wasteful. 60s captures every fresh window without spamming.
+    # For real-time copy signals we use Polygon RPC WebSocket (Phase 2).
+    scheduler.add_job(_firehose_ingest, "interval", seconds=60,
+                       id="firehose_ingest",
+                       coalesce=True, max_instances=1, misfire_grace_time=30)
+    scheduler.add_job(_firehose_rank, "cron", minute="*/15",
+                       id="firehose_rank",
+                       coalesce=True, max_instances=1, misfire_grace_time=600)
     scheduler.start()
     logger.info("Scheduler started")
 

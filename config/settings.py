@@ -10,21 +10,50 @@ logger = logging.getLogger(__name__)
 
 
 def _fetch_secret_manager(name: str, project: str = "crypto-agent-494710") -> str:
-    """Read a secret from GCP Secret Manager via REST.
-    Same helper as crypto-trader to avoid grpc/ssl conflicts on the VM."""
-    try:
-        import urllib.request
-        import json as _json
-        import base64
+    """Read a secret from GCP Secret Manager.
 
+    Two-tier auth so the same helper works on a GCE VM AND on a laptop:
+      1. Metadata-server token (default on GCE — fast, no deps)
+      2. Application Default Credentials (works on a laptop after
+         `gcloud auth application-default login`) — falls through to here.
+    """
+    import urllib.request
+    import json as _json
+    import base64
+
+    token = None
+    # 1) GCE metadata server (works on GCE VMs, fails fast on a laptop)
+    try:
         token_url = (
             "http://metadata.google.internal/computeMetadata/v1/"
             "instance/service-accounts/default/token"
         )
         req = urllib.request.Request(token_url, headers={"Metadata-Flavor": "Google"})
-        with urllib.request.urlopen(req, timeout=5) as r:
+        with urllib.request.urlopen(req, timeout=2) as r:
             token = _json.loads(r.read().decode("utf-8"))["access_token"]
+    except Exception:
+        token = None
 
+    # 2) ADC fallback — requires `google-auth` (already pulled in by
+    #    google-cloud-storage which the bot uses for GCS sync). Works on
+    #    a laptop after `gcloud auth application-default login`.
+    if not token:
+        try:
+            import google.auth
+            from google.auth.transport.requests import Request as _GReq
+            creds, _ = google.auth.default(
+                scopes=["https://www.googleapis.com/auth/cloud-platform"]
+            )
+            creds.refresh(_GReq())
+            token = creds.token
+        except Exception as e:
+            logger.debug(f"Secret Manager ADC fallback failed for {name}: {e}")
+            return ""
+
+    if not token:
+        return ""
+
+    try:
         url = (
             f"https://secretmanager.googleapis.com/v1/projects/{project}"
             f"/secrets/{name}/versions/latest:access"

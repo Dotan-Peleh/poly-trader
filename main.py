@@ -173,14 +173,15 @@ def settle_tick(notifier: Notifier):
                 Decision.id.in_(before_ids),
                 Decision.resolution_yes.isnot(None),
             ).all()
-            from strategies.cumulative import today_cumulative_line
+            from strategies.cumulative import today_cumulative_line, mode_tag
             for d in newly_resolved:
                 won = bool(d.pnl_usd is not None and d.pnl_usd > 0)
                 icon = "🎯" if won else "🔴"
                 tag = "WIN" if won else "LOSS"
                 cum = today_cumulative_line()
+                _mt = mode_tag()
                 notifier.send(
-                    f"{icon} <b>{tag}</b> <code>{d.condition_id}</code>\n"
+                    f"{icon} <b>[{_mt}] {tag}</b> <code>{d.condition_id}</code>\n"
                     f"📊 {d.side} @ {d.paid_per_unit*100:.0f}¢ | "
                     f"size=${d.size_usd:.2f}\n"
                     f"💸 P&amp;L: <b>${d.pnl_usd:+,.2f}</b>\n"

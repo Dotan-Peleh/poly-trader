@@ -736,8 +736,10 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
                      f"{sig.market_title[:35]} @ {our_ask:.3f} | size=${final_size:.2f} "
                      f"| edge={edge*100:+.1f}% | assumed_win_prob={win_prob:.0%}")
         if notifier:
+            from strategies.cumulative import mode_tag
+            _mt = mode_tag()
             notifier.send(
-                f"🐳➡️🤖 <b>COPIED {sig.wallet_name}</b>\n"
+                f"🐳➡️🤖 <b>[{_mt}] COPIED {sig.wallet_name}</b>\n"
                 f"📊 {sig.market_title[:55]}\n"
                 f"➡️ {side} @ ${our_ask:.3f} | size=${final_size:.2f}\n"
                 f"💰 their position: {sig.new_size:.0f} contracts\n"
@@ -833,10 +835,11 @@ def execute_copy_exits(exit_signals: list, notifier=None) -> int:
         if notifier:
             pnl = result.get("pnl_usd", 0)
             icon = "✅" if pnl > 0 else "🔴"
-            from strategies.cumulative import today_cumulative_line
+            from strategies.cumulative import today_cumulative_line, mode_tag
             cum = today_cumulative_line()
+            _mt = mode_tag()
             notifier.send(
-                f"🐳⬅️🤖 <b>SMART EXIT — CLOSED COPY</b>\n"
+                f"🐳⬅️🤖 <b>[{_mt}] SMART EXIT — CLOSED COPY</b>\n"
                 f"👤 {sig.wallet_name} reduced {sig.prev_size:.0f}→{sig.new_size:.0f} "
                 f"(-{sig.reduction_pct*100:.0f}%)\n"
                 f"📊 {sig.market_title[:55]}\n"

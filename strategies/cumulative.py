@@ -18,6 +18,17 @@ logger = logging.getLogger(__name__)
 _IST = ZoneInfo("Asia/Jerusalem")
 
 
+def mode_tag() -> str:
+    """Short LIVE/PAPER tag for Telegram message titles. Reads the runtime
+    mode flag (poly_live/mode.txt via halt_flag.effective_mode), so the tag
+    flips immediately when you toggle the dashboard switch."""
+    try:
+        from monitor.halt_flag import effective_mode
+        return "LIVE" if effective_mode() == "live" else "PAPER"
+    except Exception:
+        return "PAPER"
+
+
 def _ist_midnight_utc() -> datetime:
     """UTC timestamp of the most recent 00:00 in Asia/Jerusalem."""
     now_ist = datetime.now(_IST)

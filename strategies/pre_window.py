@@ -345,8 +345,10 @@ def evaluate_market(
                  f"@ {sizing.paid_per_unit:.3f} | edge={edge*100:+.1f}% | {reason}")
     if notifier:
         icon = "🟢" if side == "YES" else "🔴"
+        from strategies.cumulative import mode_tag
+        _mt = mode_tag()
         notifier.send(
-            f"{icon} <b>{side} fired ({STRATEGY_TAG})</b> "
+            f"{icon} <b>[{_mt}] {side} fired ({STRATEGY_TAG})</b> "
             f"<code>{market.condition_id[:24]}...</code>\n"
             f"📊 fair={sig.fair_yes_prob*100:.1f}% vs implied={implied_yes*100:.1f}%\n"
             f"💸 edge={edge*100:+.1f}% | size=${final_size:.2f} "

@@ -232,7 +232,7 @@ def evaluate_open_positions(notifier=None) -> int:
                     from strategies.cumulative import today_cumulative_line
                     cum = today_cumulative_line()
                     notifier.send(
-                        f"{icon} <b>EARLY {tag} ({mode_label})</b> <code>{d.condition_id[:20]}…</code>\n"
+                        f"{icon} <b>[{mode_label}] EARLY {tag}</b> <code>{d.condition_id[:20]}…</code>\n"
                         f"📊 {d.side} @ {cost*100:.0f}¢ → exit @ {cur_per_share*100:.0f}¢\n"
                         f"💸 P&amp;L: <b>${result['pnl_usd']:+.4f}</b>\n"
                         f"💡 reason: {exit_reason}\n"

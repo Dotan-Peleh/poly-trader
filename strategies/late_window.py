@@ -250,8 +250,10 @@ def evaluate_market(market: PolymarketMarket, wallet: Wallet, portfolio: Portfol
 
     icon = "🟢" if intent.side == "YES" else "🔴"
     if notifier:
+        from strategies.cumulative import mode_tag
+        _mt = mode_tag()
         notifier.send(
-            f"{icon} <b>{intent.side} fired</b> <code>{market.condition_id}</code>\n"
+            f"{icon} <b>[{_mt}] {intent.side} fired</b> <code>{market.condition_id}</code>\n"
             f"📊 model={intent.model_yes_prob*100:.1f}% vs implied={intent.implied_yes_prob*100:.1f}%\n"
             f"💸 edge={intent.edge*100:+.1f}% | "
             f"size=${final_size:.2f} ({sizing.units:.0f} contracts @ {sizing.paid_per_unit*100:.0f}¢)\n"

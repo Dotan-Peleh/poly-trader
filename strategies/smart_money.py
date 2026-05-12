@@ -833,12 +833,15 @@ def execute_copy_exits(exit_signals: list, notifier=None) -> int:
         if notifier:
             pnl = result.get("pnl_usd", 0)
             icon = "✅" if pnl > 0 else "🔴"
+            from strategies.cumulative import today_cumulative_line
+            cum = today_cumulative_line()
             notifier.send(
                 f"🐳⬅️🤖 <b>SMART EXIT — CLOSED COPY</b>\n"
                 f"👤 {sig.wallet_name} reduced {sig.prev_size:.0f}→{sig.new_size:.0f} "
                 f"(-{sig.reduction_pct*100:.0f}%)\n"
                 f"📊 {sig.market_title[:55]}\n"
-                f"{icon} our P&amp;L: <b>${pnl:+.2f}</b>"
+                f"{icon} our P&amp;L: <b>${pnl:+.2f}</b>\n"
+                f"{cum}"
             )
 
     return closed

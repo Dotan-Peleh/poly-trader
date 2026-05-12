@@ -173,17 +173,20 @@ def settle_tick(notifier: Notifier):
                 Decision.id.in_(before_ids),
                 Decision.resolution_yes.isnot(None),
             ).all()
+            from strategies.cumulative import today_cumulative_line
             for d in newly_resolved:
                 won = bool(d.pnl_usd is not None and d.pnl_usd > 0)
                 icon = "🎯" if won else "🔴"
                 tag = "WIN" if won else "LOSS"
+                cum = today_cumulative_line()
                 notifier.send(
                     f"{icon} <b>{tag}</b> <code>{d.condition_id}</code>\n"
                     f"📊 {d.side} @ {d.paid_per_unit*100:.0f}¢ | "
                     f"size=${d.size_usd:.2f}\n"
                     f"💸 P&amp;L: <b>${d.pnl_usd:+,.2f}</b>\n"
                     f"💡 model={d.model_yes_prob*100:.1f}% vs implied={d.implied_yes_prob*100:.1f}%, "
-                    f"resolution_yes={d.resolution_yes}"
+                    f"resolution_yes={d.resolution_yes}\n"
+                    f"{cum}"
                 )
         logger.info(f"settle_tick: {n} decisions settled")
     except Exception as e:

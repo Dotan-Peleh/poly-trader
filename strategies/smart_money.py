@@ -609,6 +609,20 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
         today_count = _todays_copy_count()
         min_score = _adaptive_min_score(today_count, DAILY_COPY_CAP)
         if today_count >= DAILY_COPY_CAP:
+            # Fire a one-shot Telegram alert the first time we hit the cap today
+            global _CAP_ALERTED_DATE
+            try:
+                _alerted = _CAP_ALERTED_DATE
+            except NameError:
+                _alerted = None
+            today_str = _dt.utcnow().strftime("%Y-%m-%d")
+            if notifier and _alerted != today_str:
+                notifier.send(
+                    f"🛑 <b>Daily smart-copy cap reached</b>\n"
+                    f"Hit {DAILY_COPY_CAP} fires for today. New signals will\n"
+                    f"be rejected until UTC midnight (~{24 - _dt.utcnow().hour}h from now)."
+                )
+                globals()["_CAP_ALERTED_DATE"] = today_str
             logger.info(f"smart_money: SKIP (daily cap {DAILY_COPY_CAP} reached) "
                          f"{sig.market_title[:40]}")
             continue

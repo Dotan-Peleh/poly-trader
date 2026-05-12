@@ -148,24 +148,60 @@ def _parse_log(log: dict) -> Optional[RealTimeSignal]:
         return None
 
 
-async def _ws_loop(api_key: str, on_signal):
+def _load_tracked_wallets(engine, max_n: int = 15) -> list:
+    """Pull the top-N tracked smart wallets so we filter at the source.
+    Alchemy bills per delivered event — only sending events for OUR
+    wallets cuts cost by ~99% vs receiving the full firehose."""
+    try:
+        from sqlalchemy.orm import Session
+        from sqlalchemy import text as _t
+        with Session(engine) as s:
+            rows = s.execute(_t(
+                "SELECT wallet FROM smart_wallet_rankings "
+                "ORDER BY rank_score DESC LIMIT :n"
+            ), {"n": max_n}).fetchall()
+        return [r[0] for r in rows if r[0] and r[0].startswith("0x")]
+    except Exception as e:
+        logger.warning(f"polygon_stream: load tracked wallets failed: {e}")
+        return []
+
+
+async def _ws_loop(api_key: str, on_signal, engine=None):
     """Single iteration of the WebSocket subscription loop. Reconnects on
-    disconnect via the outer driver. Yields control on every event so the
-    handler can run synchronously."""
-    import websockets  # lazy import — only needed when stream runs
+    disconnect via the outer driver."""
+    import websockets
     url = f"wss://polygon-mainnet.g.alchemy.com/v2/{api_key}"
+
+    # Resolve wallets we care about so Alchemy filters server-side.
+    # eth_subscribe accepts an ARRAY in the topic slot which means
+    # "topic IN this list" — so we get only events to our wallets.
+    tracked = _load_tracked_wallets(engine, max_n=15) if engine is not None else []
+    if not tracked:
+        logger.error("polygon_stream: no tracked wallets — cannot subscribe "
+                      "with server-side filter (would be too expensive). "
+                      "Run a wallet rank job first.")
+        # Sleep and let driver retry
+        await asyncio.sleep(60)
+        return
+
+    to_filter = [_pad_address_topic(w) for w in tracked]
+    logger.info(f"polygon_stream: subscribing with to-filter for {len(tracked)} "
+                 f"tracked wallets")
+
     async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
-        # Subscribe to ALL TransferSingle events on ConditionalTokens.
-        # Polymarket uses several exchange/relayer contracts; rather than
-        # whitelisting operators we accept everything (~80 events/sec) and
-        # post-filter by `to` in Python (cheap SQLite lookup vs rankings).
-        # We DROP zero-address transfers (= token redemptions, not trades)
-        # in the parser.
+        # Server-side filter: only TransferSingle events where to ∈ tracked.
+        # This drops 47 events/sec → ~3-5 events/sec, cutting Alchemy CU
+        # consumption by ~95%.
         sub_req = {
             "jsonrpc": "2.0", "id": 1, "method": "eth_subscribe",
             "params": ["logs", {
                 "address": CONDITIONAL_TOKENS,
-                "topics": [TRANSFER_SINGLE_TOPIC],
+                "topics": [
+                    TRANSFER_SINGLE_TOPIC,
+                    None,                  # operator: any
+                    None,                  # from: any
+                    to_filter,             # to: must be in our tracked list
+                ],
             }],
         }
         await ws.send(json.dumps(sub_req))
@@ -192,12 +228,14 @@ async def _ws_loop(api_key: str, on_signal):
                 logger.warning(f"polygon_stream: on_signal handler failed: {e}")
 
 
-async def _stream_driver(api_key: str, on_signal):
-    """Outer driver: reconnect on any websocket error with exponential backoff."""
+async def _stream_driver(api_key: str, on_signal, engine=None):
+    """Outer driver: reconnect on any websocket error with exponential backoff.
+    Re-reads the tracked wallet list on each reconnect so wallet-rank
+    changes propagate without a process restart."""
     backoff = 1.0
     while True:
         try:
-            await _ws_loop(api_key, on_signal)
+            await _ws_loop(api_key, on_signal, engine=engine)
         except Exception as e:
             logger.warning(f"polygon_stream: ws loop ended: {type(e).__name__}: {e}; "
                             f"reconnecting in {backoff:.0f}s")
@@ -207,7 +245,7 @@ async def _stream_driver(api_key: str, on_signal):
             backoff = 1.0
 
 
-def start_stream_in_thread(api_key: str, on_signal):
+def start_stream_in_thread(api_key: str, on_signal, engine=None):
     """Spin up the asyncio event loop in a daemon thread. Caller passes a
     synchronous `on_signal(RealTimeSignal)` callback that runs on the loop
     thread (do not block heavily here — offload to a queue if needed)."""
@@ -215,7 +253,7 @@ def start_stream_in_thread(api_key: str, on_signal):
 
     def _runner():
         try:
-            asyncio.run(_stream_driver(api_key, on_signal))
+            asyncio.run(_stream_driver(api_key, on_signal, engine=engine))
         except Exception as e:
             logger.error(f"polygon_stream: thread crashed: {e}")
 

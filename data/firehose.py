@@ -287,7 +287,13 @@ def rank_wallets_from_firehose(engine, lookback_days: int = 7,
             if not isinstance(pos, list):
                 continue
             realized = sum(float(p.get("realizedPnl") or 0) for p in pos)
-            if realized < 1000:  # ignore wallets with < $1k lifetime profit
+            # Quality threshold: only track wallets that are CLEARLY smart money.
+            # $500k+ lifetime + >= $300 avg trade size = proven track record
+            # with meaningful conviction. Lower thresholds let in noise wallets
+            # whose copies don't generate edge.
+            if realized < 500_000:
+                continue
+            if (r.avg_trade_usd or 0) < 300:
                 continue
             # Pseudonym is on the trade row; pull from any recent trade
             with Session(engine) as session:

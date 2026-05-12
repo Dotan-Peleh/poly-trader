@@ -342,8 +342,10 @@ def main():
                 except Exception as e:
                     logger.warning(f"polygon_stream signal handler: {e}")
 
+            from data.storage import engine as _eng_for_stream
             start_stream_in_thread(settings.polygon_alchemy_api_key,
-                                     _on_realtime_signal)
+                                     _on_realtime_signal,
+                                     engine=_eng_for_stream)
         except Exception as e:
             logger.error(f"polygon_stream failed to start: {e}")
     else:

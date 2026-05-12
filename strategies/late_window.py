@@ -166,6 +166,38 @@ def evaluate_market(market: PolymarketMarket, wallet: Wallet, portfolio: Portfol
                     f"(today P&L ${today_pnl:+.2f})"
                 )
             return None
+
+        # ── Real on-chain balance gate ───────────────────────────────
+        # The paper `wallet.available_balance()` is starting_capital + paper
+        # P&L − open paper risk. In LIVE mode we must size against the
+        # REAL pUSD sitting in the Safe, not the simulated bankroll, or
+        # the CLOB will reject orders bigger than what's actually there.
+        try:
+            from data.polymarket_wallet import _fetch_balance
+            real_bal = _fetch_balance() or {}
+            real_avail = float(real_bal.get("effective") or 0.0)
+        except Exception as e:
+            logger.warning(
+                f"[{market.condition_id}] live balance fetch failed: {e}; "
+                "refusing live order to avoid blind sizing"
+            )
+            return None
+        if real_avail < 1.0:
+            logger.info(
+                f"[{market.condition_id}] live skipped: real pUSD ${real_avail:.2f}"
+            )
+            return None
+        # Leave a 5% buffer for the 1% CLOB fee + slippage.
+        max_real_size = round(real_avail * 0.95, 2)
+        if final_size > max_real_size:
+            logger.info(
+                f"[{market.condition_id}] live size capped: paper sized "
+                f"${final_size:.2f}, real pUSD allows ${max_real_size:.2f}"
+            )
+            final_size = max_real_size
+        if final_size < 1.0:
+            return None
+
         # Smoke-period cap (first 24h)
         bot_started = getattr(evaluate_market, "_bot_started_at", datetime.utcnow())
         evaluate_market._bot_started_at = bot_started

@@ -157,26 +157,59 @@ def place_market_order(token_id: str, side: str, size_usd: float,
     )
     try:
         signed = client.create_order(args)
-        # GTC = good-til-cancel (lives in the book if not immediately filled);
-        # FOK = fill-or-kill (cancel if can't immediately fill)
-        # We use IOC-equivalent (GTC + immediate cancel after timeout
-        # in the calling code) for the smoke trades.
-        resp = client.post_order(signed, OrderType.GTC)
-        success = bool(resp and resp.get("success"))
-        # Pull avg fill price if returned, else use limit
-        filled = resp.get("makingAmount") or units
-        avg_price = limit_price
+        # FAK = Fill-And-Kill: take whatever's available at our limit and
+        # cancel the rest. Prevents orders from lingering on the book
+        # unfilled (the previous GTC choice caused phantom decisions —
+        # bot recorded a "filled $11" trade while only $1 actually
+        # matched, then settle_tick wrote fake P&L when the market
+        # resolved on tape the bot never held).
+        resp = client.post_order(signed, OrderType.FAK)
+        resp = resp or {}
+
+        # Polymarket reports fill via makingAmount (USD spent by buyer)
+        # and takingAmount (shares received). Field semantics from
+        # py-clob-client docs: for a BUY order:
+        #   makingAmount = USD we paid
+        #   takingAmount = shares we received
+        # Some versions of the API return zero for both even on
+        # success=true when the order matched 0 shares (i.e. queued but
+        # the matcher didn't fill any). Treat that as failure — there
+        # is no real position to track.
+        try:
+            paid_usd = float(resp.get("makingAmount") or 0.0)
+        except (TypeError, ValueError):
+            paid_usd = 0.0
+        try:
+            shares = float(resp.get("takingAmount") or 0.0)
+        except (TypeError, ValueError):
+            shares = 0.0
+
+        # Real fill must move BOTH numbers. If either is zero, nothing
+        # actually traded — refuse to record as a successful fill so the
+        # caller bails and doesn't create a phantom decision row.
+        truly_filled = paid_usd > 0.001 and shares > 0.001
+        api_success = bool(resp.get("success"))
+        success = api_success and truly_filled
+
+        if api_success and not truly_filled:
+            logger.warning(
+                f"place_market_order: CLOB returned success=true but no fill "
+                f"(makingAmount={paid_usd}, takingAmount={shares}, "
+                f"status={resp.get('status')!r}). Treating as failed."
+            )
+
+        avg_price = (paid_usd / shares) if shares > 0 else limit_price
         return OrderFill(
             success=success,
             side=side,
-            units=float(filled),
-            paid_per_unit=avg_price,
-            size_usd=size_usd,
-            raw_response=resp or {},
+            units=shares,            # actual shares filled, not requested
+            paid_per_unit=avg_price, # actual avg fill, not the limit
+            size_usd=paid_usd,       # actual USD spent, not requested
+            raw_response=resp,
         )
     except Exception as e:
         logger.error(f"place_market_order failed: {e}")
-        return OrderFill(False, side, 0.0, 0.0, size_usd,
+        return OrderFill(False, side, 0.0, 0.0, 0.0,
                           {"error": str(e)[:240]})
 
 

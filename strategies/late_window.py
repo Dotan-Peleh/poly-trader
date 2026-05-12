@@ -223,15 +223,29 @@ def evaluate_market(market: PolymarketMarket, wallet: Wallet, portfolio: Portfol
         fill = place_market_order(token_id, intent.side, final_size, ask)
         if not fill.success:
             err = fill.raw_response.get("error", "unknown")
+            status = fill.raw_response.get("status")
             if notifier:
                 notifier.send(
                     f"❌ <b>LIVE order failed</b> on {intent.side} "
                     f"<code>{market.condition_id}</code>\n"
-                    f"💡 {err[:200]}"
+                    f"💡 {err[:200]} status={status}"
                 )
             return None
+        # ── Critical: persist what ACTUALLY filled, not what we requested ──
+        # On FAK orders, Polymarket may fill only a fraction of the
+        # requested size (thin order book at the 12-min-pre-close window).
+        # If we record `final_size` (the request) instead of `fill.size_usd`
+        # (the actual cost), the decision row's pnl_usd calc at settlement
+        # uses the wrong cost basis and Telegram lies to the user.
         fill_units = fill.units
         fill_price = fill.paid_per_unit
+        if fill.size_usd < final_size * 0.99:  # filled <99% of requested
+            logger.info(
+                f"[{market.condition_id}] PARTIAL FILL: requested "
+                f"${final_size:.2f}, filled ${fill.size_usd:.2f} "
+                f"({fill.units:.2f} shares @ {fill.paid_per_unit:.3f})"
+            )
+        final_size = round(fill.size_usd, 4)
 
     # Persist trade row (paper or live; outcome backfilled at settlement)
     decision_id = record_paper_trade(

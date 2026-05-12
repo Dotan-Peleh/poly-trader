@@ -95,8 +95,17 @@ def record_paper_trade(
     minutes_to_close: float, sigma_per_minute: float,
     model_yes_prob: float, implied_yes_prob: float, edge: float,
     size_usd: float, paid_per_unit: float,
+    mode_override: Optional[str] = None,
 ) -> int:
-    """Persist a paper trade row. Returns the decision id."""
+    """Persist a trade row. Returns the decision id.
+
+    `mode_override` lets callers force the row's mode independent of the
+    global setting — used by strategies that haven't yet been wired to
+    real on-chain execution (e.g. smart_money) so their decisions stay
+    tagged `paper` even when the bot's effective_mode is `live`. This
+    prevents phantom "live" rows for code paths that never actually
+    placed an on-chain order.
+    """
     units = size_usd / paid_per_unit if paid_per_unit > 0 else 0.0
     fill_price = paid_per_unit  # paper assumption: take the offered price flat
     with Session(engine) as session:
@@ -115,7 +124,7 @@ def record_paper_trade(
             paid_per_unit=paid_per_unit,
             units_bought=units,
             fill_price=fill_price,
-            mode=settings.trading_mode,
+            mode=mode_override or settings.trading_mode,
         )
         session.add(d)
         session.commit()

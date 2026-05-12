@@ -701,6 +701,13 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
             continue
 
         # 9. Fire paper trade
+        # NOTE: smart_money currently has NO live-execution path — it does
+        # not call place_market_order. Force mode='paper' on the decision
+        # row even when the global mode is "live", otherwise this strategy
+        # would create phantom "live" rows that settle_tick later marks with
+        # fake P&L (the source of the earlier "WIN $+10.81" Telegram lie).
+        # When real on-chain execution is wired here we can drop the
+        # override and use a real `fill = place_market_order(...)` result.
         btc_now = latest_btc_price() or 0.0
         sigma = estimate_sigma_per_minute() or 0.0001
         decision_id = record_paper_trade(
@@ -715,6 +722,7 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
             edge=edge if side == "YES" else -edge,
             size_usd=final_size,
             paid_per_unit=sizing.paid_per_unit,
+            mode_override="paper",
         )
 
         # Tag: smart_copy:wallet|score=N|claude=APPROVE|conf=0.X — learning loop reads these

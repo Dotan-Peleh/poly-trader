@@ -116,6 +116,9 @@ def _live_sell(condition_id: str, side: str, units: float,
     """Place a live SELL on Polymarket via py-clob-client.
     For YES position: sell YES tokens at the current best bid.
     For NO position: sell NO tokens at the current best NO bid.
+
+    Returns dict with success (true only on real partial+ fill),
+    fill_units, fill_price, proceeds_usd, raw.
     """
     try:
         from execution.polymarket_orders import _get_client
@@ -137,11 +140,38 @@ def _live_sell(condition_id: str, side: str, units: float,
         args = OrderArgs(token_id=token_id, price=cross_price,
                           size=round(units, 4), side="SELL")
         signed = client.create_order(args)
-        resp = client.post_order(signed, OrderType.GTC)
+        # FAK so an unfilled SELL doesn't sit on the book waiting; we'd
+        # rather know now that we couldn't exit and try again next tick.
+        resp = client.post_order(signed, OrderType.FAK)
+        resp = resp or {}
+
+        # SELL fill semantics (mirror BUY in polymarket_orders.py):
+        #   makingAmount = shares we sold
+        #   takingAmount = USD we received
+        try:
+            shares_sold = float(resp.get("makingAmount") or 0.0)
+        except (TypeError, ValueError):
+            shares_sold = 0.0
+        try:
+            proceeds_usd = float(resp.get("takingAmount") or 0.0)
+        except (TypeError, ValueError):
+            proceeds_usd = 0.0
+        truly_filled = shares_sold > 0.001 and proceeds_usd > 0.001
+        api_success = bool(resp.get("success"))
+        if api_success and not truly_filled:
+            logger.warning(
+                f"_live_sell: CLOB success=true but no fill "
+                f"(makingAmount={shares_sold}, takingAmount={proceeds_usd}, "
+                f"status={resp.get('status')!r})"
+            )
+        avg_price = (proceeds_usd / shares_sold) if shares_sold > 0 else cross_price
         return {
-            "success": bool(resp and resp.get("success")),
+            "success": api_success and truly_filled,
+            "fill_units": shares_sold,
+            "fill_price": avg_price,
+            "proceeds_usd": proceeds_usd,
             "limit_price": cross_price,
-            "raw": resp or {},
+            "raw": resp,
         }
     except Exception as e:
         logger.error(f"_live_sell failed: {e}")
@@ -154,9 +184,14 @@ def evaluate_open_positions(notifier=None) -> int:
     closed = 0
     now = datetime.utcnow()
     with Session(engine) as session:
+        # No mode filter — exit logic routes per-row: paper rows resolve
+        # via _resolve_paper_at_mid, live rows attempt a real SELL via
+        # _live_sell. With smart_money tagged 'paper' and late_window
+        # tagged 'live', both classes coexist; filtering by the global
+        # mode would either freeze paper rows after a live flip, or
+        # ignore live rows after a paper flip.
         opens = (session.query(Decision)
-                 .filter(Decision.mode == settings.trading_mode,
-                         Decision.resolution_yes.is_(None),
+                 .filter(Decision.resolution_yes.is_(None),
                          Decision.pnl_usd.is_(None))
                  .all())
         # Pull market info for each
@@ -210,25 +245,48 @@ def evaluate_open_positions(notifier=None) -> int:
                     f"ratio={ratio:.2f}x reason={exit_reason}"
                 )
 
-                if effective_mode() == "live":
+                # Route by THIS row's recorded mode, not the global flag.
+                # A paper-tagged row always exits via paper math; a live-
+                # tagged row attempts a real SELL.
+                row_is_live = (d.mode == "live")
+                if row_is_live:
                     fill = _live_sell(d.condition_id, d.side,
                                        float(d.units_bought or 0),
                                        m.yes_token_id, m.no_token_id, book)
                     if not fill or not fill.get("success"):
                         if notifier:
+                            err = (fill or {}).get('error', 'no fill')[:120]
                             notifier.send(
                                 f"⚠️ Early-exit SELL FAILED <code>{d.condition_id}</code>\n"
-                                f"💡 {(fill or {}).get('error', 'unknown')[:120]}"
+                                f"💡 {err}"
                             )
                         continue
+                    # Real fill — compute P&L from actual proceeds vs the
+                    # actual cost basis stored on the decision row.
+                    proceeds = float(fill.get("proceeds_usd") or 0.0)
+                    cost_basis = float(d.size_usd or 0)
+                    # 1% CLOB fee approximation (no fee field in resp yet)
+                    fee = proceeds * 0.01
+                    pnl_usd = proceeds - cost_basis - fee
+                    won = pnl_usd > 0
+                    # resolution_yes derives so win-rate stats see it
+                    d.resolution_yes = (1 if won else 0) if d.side == "YES" \
+                        else (0 if won else 1)
+                    d.pnl_usd = round(pnl_usd, 4)
+                    d.resolved_at = datetime.utcnow()
+                    prev = (d.notes or "").strip()
+                    tagn = f"early_exit:{exit_reason}|live_sell"
+                    d.notes = f"{tagn}|{prev}" if prev else tagn
+                    session.commit()
+                    result = {"pnl_usd": pnl_usd, "proceeds": proceeds}
+                else:
+                    # Paper path unchanged
+                    result = _resolve_paper_at_mid(d.id, yes_mid, exit_reason)
 
-                # Always also book the paper P&L (for both modes the
-                # decision row's pnl_usd reflects the realised exit P&L)
-                result = _resolve_paper_at_mid(d.id, yes_mid, exit_reason)
                 if result and notifier:
                     icon = "🎯" if result["pnl_usd"] > 0 else "🔴"
                     tag = "WIN" if result["pnl_usd"] > 0 else "LOSS"
-                    mode_label = "LIVE" if effective_mode() == "live" else "PAPER"
+                    mode_label = "LIVE" if row_is_live else "PAPER"
                     from strategies.cumulative import today_cumulative_line
                     cum = today_cumulative_line()
                     notifier.send(

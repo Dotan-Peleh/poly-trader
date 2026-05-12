@@ -324,10 +324,13 @@ def settle_resolved_markets() -> int:
     settled = 0
     now = datetime.utcnow()
     with Session(engine) as session:
-        # Find unresolved decisions whose market has closed
+        # Find unresolved decisions whose market has closed.
+        # No mode filter: paper and live rows both need resolving at
+        # expiry. settle_paper_trade computes pnl based on resolution
+        # and the row's recorded paid_per_unit / units_bought, which are
+        # correct for both modes (live rows store actual fill values).
         decisions = (session.query(Decision)
-                     .filter(Decision.mode == settings.trading_mode,
-                             Decision.resolution_yes.is_(None))
+                     .filter(Decision.resolution_yes.is_(None))
                      .all())
         # For each, look up the market
         for d in decisions:

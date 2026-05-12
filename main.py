@@ -154,11 +154,11 @@ def settle_tick(notifier: Notifier):
         from data.storage import engine, Decision
 
         # Find unresolved decisions whose markets have closed before settling
-        # (so we can capture and ping the actual P&L)
+        # (so we can capture and ping the actual P&L).
+        # No mode filter — paper AND live rows both need settle/notify.
         before_ids = set()
         with Session(engine) as session:
             for d in session.query(Decision).filter(
-                Decision.mode == settings.trading_mode,
                 Decision.resolution_yes.is_(None),
             ).all():
                 before_ids.add(d.id)
@@ -173,13 +173,16 @@ def settle_tick(notifier: Notifier):
                 Decision.id.in_(before_ids),
                 Decision.resolution_yes.isnot(None),
             ).all()
-            from strategies.cumulative import today_cumulative_line, mode_tag
+            from strategies.cumulative import today_cumulative_line
             for d in newly_resolved:
                 won = bool(d.pnl_usd is not None and d.pnl_usd > 0)
                 icon = "🎯" if won else "🔴"
                 tag = "WIN" if won else "LOSS"
                 cum = today_cumulative_line()
-                _mt = mode_tag()
+                # Tag per row's actual mode — a paper-tagged decision
+                # always reports as PAPER even if the bot is currently
+                # in live mode, and vice versa.
+                _mt = "LIVE" if d.mode == "live" else "PAPER"
                 notifier.send(
                     f"{icon} <b>[{_mt}] {tag}</b> <code>{d.condition_id}</code>\n"
                     f"📊 {d.side} @ {d.paid_per_unit*100:.0f}¢ | "

@@ -700,14 +700,77 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
                          f"{verdict.get('reason','')[:80]}) {sig.market_title[:40]}")
             continue
 
-        # 9. Fire paper trade
-        # NOTE: smart_money currently has NO live-execution path — it does
-        # not call place_market_order. Force mode='paper' on the decision
-        # row even when the global mode is "live", otherwise this strategy
-        # would create phantom "live" rows that settle_tick later marks with
-        # fake P&L (the source of the earlier "WIN $+10.81" Telegram lie).
-        # When real on-chain execution is wired here we can drop the
-        # override and use a real `fill = place_market_order(...)` result.
+        # 9. Fire trade — paper math vs real on-chain via place_market_order
+        from monitor.halt_flag import effective_mode as _eff_mode
+        is_live = (_eff_mode() == "live")
+        fill_units = sizing.units
+        fill_price = sizing.paid_per_unit
+        fill_size = final_size
+        mode_row = "paper"
+
+        if is_live:
+            # Cap to real on-chain pUSD with a 5% buffer for fee+slip
+            try:
+                from data.polymarket_wallet import _fetch_balance
+                real_bal = _fetch_balance() or {}
+                real_avail = float(real_bal.get("effective") or 0.0)
+            except Exception as e:
+                logger.warning(f"smart_money: live balance fetch failed: {e}; "
+                                "refusing live order")
+                continue
+            if real_avail < 1.0:
+                logger.info(f"smart_money: SKIP (live pUSD ${real_avail:.2f} < $1) "
+                             f"{sig.market_title[:40]}")
+                continue
+            max_real = round(real_avail * 0.95, 2)
+            if final_size > max_real:
+                logger.info(f"smart_money: live size capped {final_size:.2f}→{max_real:.2f}")
+                final_size = max_real
+            # Smoke-period cap (first 24h: $5/trade)
+            from execution.polymarket_orders import (
+                place_market_order, cap_for_smoke_period, daily_loss_halts,
+            )
+            from execution.wallet import Wallet as _W
+            today_real_pnl = _W().realized_pnl()
+            if daily_loss_halts(today_real_pnl):
+                logger.info(f"smart_money: SKIP (daily-loss halt at ${today_real_pnl:+.2f})")
+                continue
+            bot_started = globals().get("_BOT_STARTED_AT") or _dt.utcnow()
+            globals()["_BOT_STARTED_AT"] = bot_started
+            capped = cap_for_smoke_period(final_size, bot_started)
+            if capped < final_size:
+                logger.info(f"smart_money: smoke-cap {final_size:.2f}→{capped:.2f}")
+                final_size = capped
+            if final_size < 1.0:
+                continue
+            # Token id for this side — pulled from the market row loaded earlier
+            token_id = m.yes_token_id if side == "YES" else m.no_token_id
+            if not token_id:
+                logger.warning(f"smart_money: missing {side} token id "
+                                f"for {sig.market_title[:40]} — cannot fire live")
+                continue
+            fill = place_market_order(token_id, side, final_size, our_ask)
+            if not fill.success:
+                err = fill.raw_response.get("error", "no fill")
+                status = fill.raw_response.get("status")
+                if notifier:
+                    notifier.send(
+                        f"❌ <b>SMART COPY LIVE failed</b> on {side} "
+                        f"<code>{sig.condition_id[:24]}…</code>\n"
+                        f"💡 {err[:160]} status={status}"
+                    )
+                continue
+            # Persist what actually filled (not the request)
+            fill_units = fill.units
+            fill_price = fill.paid_per_unit
+            fill_size = round(fill.size_usd, 4)
+            if fill_size < final_size * 0.99:
+                logger.info(
+                    f"smart_money: PARTIAL FILL requested ${final_size:.2f} "
+                    f"filled ${fill_size:.2f} ({fill_units:.2f}@{fill_price:.3f})"
+                )
+            mode_row = "live"
+
         btc_now = latest_btc_price() or 0.0
         sigma = estimate_sigma_per_minute() or 0.0001
         decision_id = record_paper_trade(
@@ -720,9 +783,9 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
             model_yes_prob=model_yes_prob,
             implied_yes_prob=yes_ask if side == "YES" else 1.0 - yes_bid,
             edge=edge if side == "YES" else -edge,
-            size_usd=final_size,
-            paid_per_unit=sizing.paid_per_unit,
-            mode_override="paper",
+            size_usd=fill_size,
+            paid_per_unit=fill_price,
+            mode_override=mode_row,
         )
 
         # Tag: smart_copy:wallet|score=N|claude=APPROVE|conf=0.X — learning loop reads these
@@ -741,15 +804,17 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
 
         fires += 1
         logger.info(f"smart_money: COPIED {sig.wallet_name} → {side} "
-                     f"{sig.market_title[:35]} @ {our_ask:.3f} | size=${final_size:.2f} "
-                     f"| edge={edge*100:+.1f}% | assumed_win_prob={win_prob:.0%}")
+                     f"{sig.market_title[:35]} @ {fill_price:.3f} | size=${fill_size:.2f} "
+                     f"| edge={edge*100:+.1f}% | assumed_win_prob={win_prob:.0%} "
+                     f"| mode={mode_row}")
         if notifier:
-            from strategies.cumulative import mode_tag
-            _mt = mode_tag()
+            # Tag from the decision row's actual mode (real fill = live;
+            # paper = paper). Avoids the prior phantom-WIN class of bug.
+            _mt = "LIVE" if mode_row == "live" else "PAPER"
             notifier.send(
                 f"🐳➡️🤖 <b>[{_mt}] COPIED {sig.wallet_name}</b>\n"
                 f"📊 {sig.market_title[:55]}\n"
-                f"➡️ {side} @ ${our_ask:.3f} | size=${final_size:.2f}\n"
+                f"➡️ {side} @ ${fill_price:.3f} | size=${fill_size:.2f}\n"
                 f"💰 their position: {sig.new_size:.0f} contracts\n"
                 f"📈 assumed win prob={win_prob:.0%} | edge={edge*100:+.1f}%\n"
                 f"💡 wallet lifetime: ${sig.wallet_lifetime_pnl:,.0f}"
@@ -830,22 +895,59 @@ def execute_copy_exits(exit_signals: list, notifier=None) -> int:
 
         # Use the BID for our side (we're selling — we get hit at the bid)
         yes_mid = (float(book.yes_bid) + float(book.yes_ask)) / 2.0
-        # _resolve_paper_at_mid already handles YES vs NO accounting via side
-        # column — we just pass the YES-mid and it converts.
-        from strategies.exit_manager import _resolve_paper_at_mid
         reason = f"smart_exit:{sig.wallet_name[:18]}_{int(sig.reduction_pct*100)}pct"
-        result = _resolve_paper_at_mid(our_pos.id, yes_mid, reason)
+        row_is_live = (our_pos.mode == "live")
+        result = None
+        if row_is_live:
+            # Real on-chain SELL via _live_sell. Same FAK + fill-check
+            # pattern as the BUY: only mark resolved if shares + USD both
+            # truly moved.
+            from strategies.exit_manager import _live_sell
+            sell = _live_sell(our_pos.condition_id, our_pos.side,
+                              float(our_pos.units_bought or 0),
+                              m.yes_token_id, m.no_token_id, book)
+            if not sell or not sell.get("success"):
+                err = (sell or {}).get('error', 'no fill')[:120]
+                logger.warning(f"smart_money: live SELL FAILED for "
+                                f"{sig.market_title[:40]}: {err}")
+                if notifier:
+                    notifier.send(
+                        f"⚠️ <b>SMART EXIT SELL FAILED</b> "
+                        f"<code>{our_pos.condition_id[:24]}…</code>\n💡 {err}"
+                    )
+                continue
+            proceeds = float(sell.get("proceeds_usd") or 0.0)
+            cost_basis = float(our_pos.size_usd or 0)
+            fee = proceeds * 0.01
+            pnl_usd = proceeds - cost_basis - fee
+            won = pnl_usd > 0
+            with Session(engine) as session:
+                d = session.get(Decision, our_pos.id)
+                if d is not None and d.resolution_yes is None:
+                    d.resolution_yes = (1 if won else 0) if d.side == "YES" \
+                        else (0 if won else 1)
+                    d.pnl_usd = round(pnl_usd, 4)
+                    d.resolved_at = _dt.utcnow()
+                    prev = (d.notes or "").strip()
+                    d.notes = f"{reason}|live_sell|{prev}" if prev else f"{reason}|live_sell"
+                    session.commit()
+                    result = {"pnl_usd": pnl_usd, "proceeds": proceeds}
+        else:
+            # Paper path unchanged
+            from strategies.exit_manager import _resolve_paper_at_mid
+            result = _resolve_paper_at_mid(our_pos.id, yes_mid, reason)
         if result is None:
             continue
         closed += 1
         logger.info(f"smart_money: CLOSED COPY {sig.wallet_name} dumped → "
-                     f"{sig.market_title[:35]} | our pnl=${result.get('pnl_usd', 0):+.2f}")
+                     f"{sig.market_title[:35]} | our pnl=${result.get('pnl_usd', 0):+.2f} "
+                     f"({'LIVE' if row_is_live else 'PAPER'})")
         if notifier:
             pnl = result.get("pnl_usd", 0)
             icon = "✅" if pnl > 0 else "🔴"
-            from strategies.cumulative import today_cumulative_line, mode_tag
+            from strategies.cumulative import today_cumulative_line
             cum = today_cumulative_line()
-            _mt = mode_tag()
+            _mt = "LIVE" if row_is_live else "PAPER"
             notifier.send(
                 f"🐳⬅️🤖 <b>[{_mt}] SMART EXIT — CLOSED COPY</b>\n"
                 f"👤 {sig.wallet_name} reduced {sig.prev_size:.0f}→{sig.new_size:.0f} "

@@ -189,6 +189,69 @@ def build_summary_message(label: str, emoji: str, hours_back: int = 12) -> str:
                          f"{blk['wins']}W ({blk['win_rate_pct']:.0f}%) "
                          f"${blk['pnl_usd']:+.2f}")
         lines.append("")
+
+    # ── LEARNING LOOP: per-feature win-rate breakdown ──
+    # Tag format: smart_copy:NAME|addr|score=N|claude=APPROVE|conf=0.X
+    # Parse and bucket so we can see what features correlate with wins.
+    import re as _re
+    def _feature(r, key):
+        n = r.notes or ""
+        m = _re.search(rf"\|{key}=([^|]+)", n)
+        return m.group(1) if m else None
+    if smart_fires:
+        # Bucket by Claude verdict
+        by_claude = {"APPROVE": [], "REJECT-passed-anyway": [], "no-claude": []}
+        for r in smart_fires:
+            v = _feature(r, "claude")
+            if v == "APPROVE":
+                by_claude["APPROVE"].append(r)
+            elif v == "REJECT":
+                by_claude["REJECT-passed-anyway"].append(r)
+            else:
+                by_claude["no-claude"].append(r)
+        lines.append("<b>Learning: by Claude verdict</b>")
+        for k, rows in by_claude.items():
+            if not rows: continue
+            blk = _summarize(rows)
+            lines.append(f"  {k}: {blk['resolved']}R {blk['wins']}W "
+                         f"({blk['win_rate_pct']:.0f}%) ${blk['pnl_usd']:+.2f}")
+        lines.append("")
+
+        # Bucket by quality score quartile
+        scored = []
+        for r in smart_fires:
+            s = _feature(r, "score")
+            if s:
+                try: scored.append((float(s), r))
+                except: pass
+        if scored:
+            scored.sort()
+            q = len(scored) // 4 or 1
+            buckets = {
+                "Q1 (low score)":  scored[:q],
+                "Q2":              scored[q:2*q],
+                "Q3":              scored[2*q:3*q],
+                "Q4 (high score)": scored[3*q:],
+            }
+            lines.append("<b>Learning: by quality-score quartile</b>")
+            for k, items in buckets.items():
+                if not items: continue
+                rows = [r for _, r in items]
+                blk = _summarize(rows)
+                if blk['resolved'] == 0:
+                    continue
+                lines.append(f"  {k}: {blk['resolved']}R {blk['wins']}W "
+                             f"({blk['win_rate_pct']:.0f}%) ${blk['pnl_usd']:+.2f}")
+            lines.append("")
+
+    # Daily cap progress
+    try:
+        from strategies.smart_money import _todays_copy_count, DAILY_COPY_CAP
+        today_n = _todays_copy_count()
+        lines.append(f"<b>Today's cap</b>: {today_n} / {DAILY_COPY_CAP} fires used")
+        lines.append("")
+    except Exception:
+        pass
     lines.append("<b>By side</b>")
     for side in ("YES", "NO"):
         d = sides[side]

@@ -57,6 +57,52 @@ STALE_ENTRY_MAX_AGE_MIN = 15           # don't copy a smart-money entry that's
                                         # easy edge is gone and other copy bots
                                         # are likely already in.
 
+# Daily cap — fire at most this many copy trades per UTC day. Higher-quality
+# signals get priority via the score-based adaptive threshold.
+DAILY_COPY_CAP = 100
+
+
+def _todays_copy_count() -> int:
+    """Count of smart_copy fires fired since UTC midnight."""
+    try:
+        from sqlalchemy.orm import Session
+        from sqlalchemy import text as _t
+        from data.storage import engine as _eng
+        with Session(_eng) as s:
+            r = s.execute(_t("""
+                SELECT COUNT(*) FROM decisions
+                WHERE notes LIKE '%smart_copy%'
+                  AND ts >= datetime('now', 'start of day')
+                  AND size_usd > 0
+            """)).first()
+        return int(r[0] or 0)
+    except Exception:
+        return 0
+
+
+def _quality_score(*, lifetime_pnl: float, edge: float, size_usd: float,
+                    implied: float) -> float:
+    """Composite signal quality. Higher = better.
+      lifetime_pnl_log × edge_pct × (1+size_log) × (1 - tail_penalty/2)
+    Bounds typical 0-2000."""
+    import math
+    lpnl_log = math.log(1 + max(lifetime_pnl, 0))    # 14-16 for $1M-$8M
+    edge_pct = max(edge, 0) * 100                     # 0-10 typical
+    size_log = math.log(1 + max(size_usd, 0))         # 0-5
+    tail_pen = abs(implied - 0.50) * 2                # 0 @ 0.50, 1 @ 0.10/0.90
+    return lpnl_log * edge_pct * (1 + size_log) * (1 - 0.5 * tail_pen)
+
+
+def _adaptive_min_score(today_count: int, cap: int = DAILY_COPY_CAP) -> float:
+    """Adaptive threshold that rises as we approach the daily cap.
+    Early in day: low threshold so we fire on moderate-quality signals.
+    Late in day: high threshold so only the absolute best slip through."""
+    if today_count >= cap:
+        return float("inf")  # hard cap
+    headroom = (cap - today_count) / cap
+    # Smooth scaling: ~50 at start of day, ~200 when 80% full
+    return 50 + (1 - headroom) ** 2 * 200
+
 
 # ── HTTP helper ──────────────────────────────────────────────────────────
 
@@ -552,6 +598,51 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
             continue
         final_size = round(sizing.size_usd, 2)
 
+        # ── Quality gate: score + adaptive threshold + daily cap ──
+        implied = yes_ask if side == "YES" else (1 - yes_bid)
+        score = _quality_score(
+            lifetime_pnl=sig.wallet_lifetime_pnl,
+            edge=edge,
+            size_usd=final_size,
+            implied=implied,
+        )
+        today_count = _todays_copy_count()
+        min_score = _adaptive_min_score(today_count, DAILY_COPY_CAP)
+        if today_count >= DAILY_COPY_CAP:
+            logger.info(f"smart_money: SKIP (daily cap {DAILY_COPY_CAP} reached) "
+                         f"{sig.market_title[:40]}")
+            continue
+        if score < min_score:
+            logger.info(f"smart_money: SKIP (score {score:.0f} < threshold "
+                         f"{min_score:.0f}, today={today_count}/{DAILY_COPY_CAP}) "
+                         f"{sig.market_title[:40]}")
+            continue
+
+        # ── Claude final gate (last call before fire) ──
+        verdict = {"decision": "APPROVE", "confidence": 0.5,
+                   "reason": "claude gate skipped"}
+        try:
+            from claude_decision.smart_money_gate import claude_gate
+            verdict = claude_gate(
+                wallet_name=sig.wallet_name,
+                wallet_lifetime_pnl=sig.wallet_lifetime_pnl,
+                market_title=sig.market_title,
+                side=side,
+                paid_per_unit=sizing.paid_per_unit,
+                edge=edge,
+                size_usd=final_size,
+                minutes_to_close=mins_to_close,
+                today_fire_count=today_count,
+                daily_cap=DAILY_COPY_CAP,
+                quality_score=score,
+            )
+        except Exception as e:
+            logger.warning(f"claude_gate import/call failed: {e}")
+        if verdict.get("decision") == "REJECT":
+            logger.info(f"smart_money: SKIP (claude REJECT — "
+                         f"{verdict.get('reason','')[:80]}) {sig.market_title[:40]}")
+            continue
+
         # 9. Fire paper trade
         btc_now = latest_btc_price() or 0.0
         sigma = estimate_sigma_per_minute() or 0.0001
@@ -569,8 +660,11 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
             paid_per_unit=sizing.paid_per_unit,
         )
 
-        # Tag: smart_copy:wallet_name|wallet_addr so summary can attribute
-        tag = f"smart_copy:{sig.wallet_name[:20]}|{sig.wallet[:12]}"
+        # Tag: smart_copy:wallet|score=N|claude=APPROVE|conf=0.X — learning loop reads these
+        claude_dec = verdict.get("decision", "?")
+        claude_conf = verdict.get("confidence", 0.5)
+        tag = (f"smart_copy:{sig.wallet_name[:20]}|{sig.wallet[:12]}|"
+               f"score={score:.0f}|claude={claude_dec}|conf={claude_conf:.2f}")
         try:
             with Session(engine) as session:
                 session.execute(

@@ -33,18 +33,33 @@ def _is_win(side: str, resolution_yes: int) -> bool:
 
 
 def _summarize(rows: List[Decision]) -> dict:
-    """Reduce a list of resolved Decision rows to the standard metric block."""
-    wins = sum(1 for r in rows if r.resolution_yes is not None and _is_win(r.side, r.resolution_yes))
+    """Reduce a list of resolved Decision rows to the standard metric block.
+    Splits realized P&L into 'gained' (wins) and 'lost' (losses) so the
+    user can see both sides separately, not just the net."""
     resolved = [r for r in rows if r.resolution_yes is not None]
-    losses = len(resolved) - wins
-    pnl = sum((r.pnl_usd or 0.0) for r in resolved)
+    win_rows = [r for r in resolved if _is_win(r.side, r.resolution_yes)]
+    loss_rows = [r for r in resolved if not _is_win(r.side, r.resolution_yes)]
+    wins = len(win_rows)
+    losses = len(loss_rows)
+    usd_gained = sum((r.pnl_usd or 0.0) for r in win_rows)         # positive
+    usd_lost = sum((r.pnl_usd or 0.0) for r in loss_rows)           # negative
+    pnl = usd_gained + usd_lost                                      # net
     win_rate = (wins / len(resolved) * 100) if resolved else 0.0
+    # W/L ratio = wins per loss. ∞ if no losses, 0 if no wins.
+    wl_ratio = (wins / losses) if losses > 0 else (float("inf") if wins > 0 else 0.0)
+    avg_win = (usd_gained / wins) if wins > 0 else 0.0
+    avg_loss = (usd_lost / losses) if losses > 0 else 0.0
     return {
         "fires": len(rows),
         "resolved": len(resolved),
         "wins": wins,
         "losses": losses,
         "win_rate_pct": win_rate,
+        "wl_ratio": wl_ratio,
+        "usd_gained": usd_gained,
+        "usd_lost": usd_lost,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
         "pnl_usd": pnl,
     }
 
@@ -152,18 +167,28 @@ def build_summary_message(label: str, emoji: str, hours_back: int = 12) -> str:
     pnl_emoji = "🟢" if rec["pnl_usd"] >= 0 else "🔴"
 
     lines = []
+    def _ratio(b):
+        r = b["wl_ratio"]
+        return "∞" if r == float("inf") else f"{r:.2f}x"
+
+    def _wl_block(b):
+        return [
+            f"  fires: {b['fires']} | resolved: {b['resolved']}",
+            f"  ✅ wins:    {b['wins']:>3}  (won  <b>${b['usd_gained']:+,.2f}</b>, avg ${b['avg_win']:+.2f}/trade)",
+            f"  ❌ losses:  {b['losses']:>3}  (lost <b>${b['usd_lost']:+,.2f}</b>, avg ${b['avg_loss']:+.2f}/trade)",
+            f"  🎯 win rate: <b>{b['win_rate_pct']:.0f}%</b>   W/L ratio: <b>{_ratio(b)}</b>",
+        ]
+
     lines.append(f"{emoji} <b>POLY-TRADER {label.upper()} SUMMARY</b>")
     lines.append("")
     lines.append(f"<b>Last {hours_back}h</b>")
-    lines.append(f"  fires: {rec['fires']} | resolved: {rec['resolved']}")
-    lines.append(f"  W/L: {rec['wins']}W / {rec['losses']}L "
-                 f"({rec['win_rate_pct']:.0f}% win rate)")
-    lines.append(f"  P&L: {pnl_emoji} <b>${rec['pnl_usd']:+.2f}</b>")
+    lines.extend(_wl_block(rec))
+    lines.append(f"  💰 NET P&L: {pnl_emoji} <b>${rec['pnl_usd']:+.2f}</b>")
     lines.append("")
-    lines.append(f"<b>All-time</b>  ({alltime['resolved']} resolved)")
-    lines.append(f"  {alltime['wins']}W / {alltime['losses']}L "
-                 f"({alltime['win_rate_pct']:.0f}% win rate)")
-    lines.append(f"  P&amp;L: <b>${alltime['pnl_usd']:+.2f}</b>")
+    lines.append(f"<b>All-time</b>")
+    lines.extend(_wl_block(alltime))
+    pnl_emoji_all = "🟢" if alltime['pnl_usd'] >= 0 else "🔴"
+    lines.append(f"  💰 NET P&amp;L: {pnl_emoji_all} <b>${alltime['pnl_usd']:+.2f}</b>")
     lines.append("")
     if v1_block or v2_block or smart_block:
         lines.append("<b>Strategy A/B</b>")

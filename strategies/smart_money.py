@@ -59,7 +59,7 @@ STALE_ENTRY_MAX_AGE_MIN = 15           # don't copy a smart-money entry that's
 
 # Daily cap — fire at most this many copy trades per UTC day. Higher-quality
 # signals get priority via the score-based adaptive threshold.
-DAILY_COPY_CAP = 100
+DAILY_COPY_CAP = 200
 
 
 def _todays_copy_count() -> int:

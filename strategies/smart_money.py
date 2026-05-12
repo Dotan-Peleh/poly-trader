@@ -59,7 +59,45 @@ STALE_ENTRY_MAX_AGE_MIN = 15           # don't copy a smart-money entry that's
 
 # Daily cap — fire at most this many copy trades per UTC day. Higher-quality
 # signals get priority via the score-based adaptive threshold.
+# CAN BE OVERRIDDEN from the dashboard via GCS runtime_config.json (see
+# _runtime_overrides() — refreshed every 60s).
 DAILY_COPY_CAP = 200
+
+# Runtime overrides loaded from GCS so dashboard can tune without restart.
+# Cached for 60s in-process to bound GCS read load.
+_RUNTIME_CONFIG = {"data": {}, "fetched_at": 0.0}
+
+
+def _runtime_overrides() -> dict:
+    """Fetch the dashboard's runtime_config.json from GCS, 60s cache.
+    Returns {} on any failure so callers can fall back to in-source defaults."""
+    import time as _tm
+    if _tm.time() - _RUNTIME_CONFIG["fetched_at"] < 60:
+        return _RUNTIME_CONFIG["data"]
+    try:
+        from google.cloud import storage as _gcs
+        import json as _json
+        client = _gcs.Client()
+        blob = (client.bucket("crypto-trader-backups-494710")
+                .blob("poly_live/runtime_config.json"))
+        if blob.exists():
+            _RUNTIME_CONFIG["data"] = _json.loads(blob.download_as_text())
+    except Exception as e:
+        logger.debug(f"runtime_overrides fetch failed: {e}")
+    _RUNTIME_CONFIG["fetched_at"] = _tm.time()
+    return _RUNTIME_CONFIG["data"]
+
+
+def _effective_daily_cap() -> int:
+    return int(_runtime_overrides().get("daily_cap", DAILY_COPY_CAP))
+
+
+def _effective_edge_min() -> float:
+    return float(_runtime_overrides().get("edge_min_pct", 4.0)) / 100.0
+
+
+def _effective_edge_max() -> float:
+    return float(_runtime_overrides().get("edge_max_pct", 10.0)) / 100.0
 
 
 def _todays_copy_count() -> int:
@@ -582,7 +620,7 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
         # model_yes_prob for size_trade = our prob of YES winning
         model_yes_prob = win_prob if side == "YES" else (1.0 - win_prob)
         edge = (win_prob - our_ask)  # signed edge on the side we're buying
-        if edge < 0.04:
+        if edge < _effective_edge_min():
             logger.info(f"smart_money: SKIP (edge {edge*100:+.1f}% < 4%) "
                          f"{sig.market_title[:40]}")
             continue
@@ -607,9 +645,9 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
             implied=implied,
         )
         today_count = _todays_copy_count()
-        min_score = _adaptive_min_score(today_count, DAILY_COPY_CAP)
-        if today_count >= DAILY_COPY_CAP:
-            # Fire a one-shot Telegram alert the first time we hit the cap today
+        eff_cap = _effective_daily_cap()
+        min_score = _adaptive_min_score(today_count, eff_cap)
+        if today_count >= eff_cap:
             global _CAP_ALERTED_DATE
             try:
                 _alerted = _CAP_ALERTED_DATE
@@ -619,17 +657,22 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
             if notifier and _alerted != today_str:
                 notifier.send(
                     f"🛑 <b>Daily smart-copy cap reached</b>\n"
-                    f"Hit {DAILY_COPY_CAP} fires for today. New signals will\n"
+                    f"Hit {eff_cap} fires for today. New signals will\n"
                     f"be rejected until UTC midnight (~{24 - _dt.utcnow().hour}h from now)."
                 )
                 globals()["_CAP_ALERTED_DATE"] = today_str
-            logger.info(f"smart_money: SKIP (daily cap {DAILY_COPY_CAP} reached) "
+            logger.info(f"smart_money: SKIP (daily cap {eff_cap} reached) "
                          f"{sig.market_title[:40]}")
             continue
         if score < min_score:
             logger.info(f"smart_money: SKIP (score {score:.0f} < threshold "
-                         f"{min_score:.0f}, today={today_count}/{DAILY_COPY_CAP}) "
+                         f"{min_score:.0f}, today={today_count}/{eff_cap}) "
                          f"{sig.market_title[:40]}")
+            continue
+        # Edge upper cap from runtime overrides
+        if abs(edge) > _effective_edge_max():
+            logger.info(f"smart_money: SKIP (edge {edge*100:+.1f}% > max "
+                         f"{_effective_edge_max()*100:.1f}%) {sig.market_title[:40]}")
             continue
 
         # ── Claude final gate (last call before fire) ──
@@ -647,7 +690,7 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
                 size_usd=final_size,
                 minutes_to_close=mins_to_close,
                 today_fire_count=today_count,
-                daily_cap=DAILY_COPY_CAP,
+                daily_cap=eff_cap,
                 quality_score=score,
             )
         except Exception as e:

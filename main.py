@@ -448,6 +448,19 @@ def main():
     scheduler.add_job(_firehose_prune, "cron", minute=7,
                        id="firehose_prune",
                        coalesce=True, max_instances=1, misfire_grace_time=300)
+    # Daily BigQuery export at 00:30 UTC — dumps decisions / stream_hits /
+    # wallet_rankings to gs://crypto-trader-backups-494710 first, then
+    # WRITE_TRUNCATE-loads into poly_trader_analytics.* tables. User can
+    # query via BigQuery console for ad-hoc analytics.
+    def _bq_export_tick():
+        try:
+            from data.bq_export import export_all
+            export_all(_engine)
+        except Exception as e:
+            logger.error(f"bq_export failed: {e}")
+    scheduler.add_job(_bq_export_tick, "cron", hour=0, minute=30,
+                       id="bq_export",
+                       coalesce=True, max_instances=1, misfire_grace_time=3600)
     scheduler.start()
     logger.info("Scheduler started")
 

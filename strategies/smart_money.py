@@ -38,8 +38,9 @@ DATA_API = "https://data-api.polymarket.com"
 LB_API = "https://lb-api.polymarket.com"
 
 # Where Phase 1 wrote the wallet list and where Phase 2 caches snapshots
-WALLET_LIST_PATH = "/home/dotanwork/poly-trader/var/smart_wallets.json"
-SNAPSHOT_PATH = "/home/dotanwork/poly-trader/var/smart_wallet_positions.json"
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+WALLET_LIST_PATH = str(_REPO_ROOT / "var" / "smart_wallets.json")
+SNAPSHOT_PATH = str(_REPO_ROOT / "var" / "smart_wallet_positions.json")
 
 # Smart-wallet selection thresholds (used by refresh_smart_wallets)
 MIN_LIFETIME_PNL = 1_000_000
@@ -590,10 +591,19 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
         # Prefer last_fill_price (their actual recent buy) over current_price
         # (avgPrice across all fills — can be misleading on scaled-in positions).
         ref_price = sig.last_fill_price if sig.last_fill_price else sig.current_price
-        if abs(our_ask - ref_price) > MAX_PRICE_DRIFT_FROM_SMART:
-            logger.info(f"smart_money: SKIP (price drift {ref_price:.3f}→"
-                         f"{our_ask:.3f}) {sig.market_title[:40]}")
-            continue
+        # Polymarket's data-api sometimes returns avgPrice=0 for very-fresh
+        # positions (the field hasn't been computed yet). If we have no
+        # usable reference price, skip the drift gate rather than blocking
+        # every signal — the tail filter below + Claude gate + edge gate
+        # still protect against blind copies.
+        if ref_price is not None and ref_price >= 0.02:
+            if abs(our_ask - ref_price) > MAX_PRICE_DRIFT_FROM_SMART:
+                logger.info(f"smart_money: SKIP (price drift {ref_price:.3f}→"
+                             f"{our_ask:.3f}) {sig.market_title[:40]}")
+                continue
+        else:
+            logger.info(f"smart_money: drift gate skipped (no ref price) "
+                         f"{sig.market_title[:40]}")
         # 5. Tail filter — refuse lottery tickets even when smart bets them
         if our_ask < 0.05 or our_ask > 0.95:
             logger.info(f"smart_money: SKIP (tail {our_ask:.2f}) {sig.market_title[:40]}")

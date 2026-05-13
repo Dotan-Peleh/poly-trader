@@ -75,11 +75,25 @@ def _fetch_pusd_balance(funder: str) -> Optional[float]:
 
 
 def _gcp_token() -> Optional[str]:
+    # 1) GCE metadata server (works on a GCE VM, fails fast on laptop)
     try:
         url = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
         req = urllib.request.Request(url, headers={"Metadata-Flavor": "Google"})
-        with urllib.request.urlopen(req, timeout=5) as r:
+        with urllib.request.urlopen(req, timeout=2) as r:
             return json.loads(r.read().decode("utf-8"))["access_token"]
+    except Exception:
+        pass
+    # 2) ADC fallback so the wallet writer works on a laptop too
+    #    (gcloud auth application-default login). Without this the
+    #    dashboard's wallet block goes stale when the bot runs at home.
+    try:
+        import google.auth
+        from google.auth.transport.requests import Request as _GReq
+        creds, _ = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        creds.refresh(_GReq())
+        return creds.token
     except Exception:
         return None
 

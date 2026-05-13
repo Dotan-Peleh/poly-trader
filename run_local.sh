@@ -34,7 +34,12 @@ fi
 # pydantic settings instance was already constructed in paper mode at
 # module import. Match the env var to the CLI flag so they agree.
 export TRADING_MODE="$MODE"
-RUNNER=(/usr/bin/caffeinate -is /usr/bin/env python3 main.py --mode "$MODE" --yes)
+
+# Stream stdout+stderr to a rolling log file so we can inspect what the
+# bot is doing without having to attach to screen. screen's hardcopy is
+# flaky; a tee to disk just works.
+LOGFILE="/tmp/poly_bot.log"
+RUNNER=(/bin/bash -c "/usr/bin/caffeinate -is /usr/bin/env python3 main.py --mode \"$MODE\" --yes 2>&1 | tee \"$LOGFILE\"")
 
 if [[ "$USE_SCREEN" == "screen" ]]; then
   # Kill any prior screen session so we don't double-run

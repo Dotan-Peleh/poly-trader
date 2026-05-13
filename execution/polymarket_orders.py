@@ -1,20 +1,29 @@
 """
-Polymarket order placement — live trading via py-clob-client.
+Polymarket order placement — live trading via py-clob-client-v2.
 
-Architecture:
-  • Paper mode: existing record_paper_trade() in execution/wallet.py logs
-    a synthetic fill at the current ask price. No SDK needed.
-  • Live mode: this module wraps py_clob_client.ClobClient with our
-    L1+L2 auth and submits actual market-style limit orders.
+Polymarket migrated from CLOB v1 to v2 on 2026-04-30. The v1 SDK
+(`py-clob-client`) is now archived and every order it signs gets
+`{error: 'order_version_mismatch'}` back. We use the v2 SDK
+(`py-clob-client-v2`) and Polymarket's new deposit-wallet model.
 
-Auth model (per docs.polymarket.com/api-reference/authentication):
-  • L1 = EIP-712 from polymarket-pk private key (signs every order)
-  • L2 = HMAC-SHA256 from polymarket-api-key + secret + passphrase
-  • The ClobClient handles both internally once initialised.
+Architecture (CLOB v2):
+  • Paper mode: existing record_paper_trade() in execution/wallet.py
+    writes a synthetic fill. No SDK needed.
+  • Live mode: this module wraps py_clob_client_v2.ClobClient with
+    L1+L2 auth and submits FAK orders signed via ERC-1271 against the
+    user's per-account deposit wallet (an ERC-1967 proxy deployed by
+    Polymarket's safe-factory).
 
-Funder (signature type):
-  • SignatureType.POLY_GNOSIS_SAFE (=2) is the default for new users
-    who connected a wallet directly to Polymarket. Set chain_id=137.
+Maker/signer model (v2):
+  • maker  = deposit wallet (derived deterministically from the EOA
+             via the safe-factory CREATE2 formula)
+  • signer = deposit wallet (POLY_1271)
+  • actual signature comes from the EOA private key — the deposit
+    wallet's contract validates it via ERC-1271
+
+The user's funds must live in the deposit wallet for the CLOB to
+match orders against it. Polymarket's UI provides a one-time
+migration from the legacy Magic Link proxy to the v2 deposit wallet.
 
 Safety caps (LIVE only):
   • Max $5 per trade for the first 24h after going live
@@ -38,54 +47,7 @@ LIVE_MAX_TRADE_USD_BUMP_HOURS = 24  # after this many hours, max_position_pct ru
 LIVE_DAILY_LOSS_HALT_USD = 10.0     # halt new entries at this realized daily loss
 
 
-_client_cache: dict = {"client": None, "ts": 0.0}
-
-
-def _get_client():
-    """Lazily build (and cache) a ClobClient instance.
-
-    Reads the 5 polymarket secrets from settings (which loads from GCP
-    Secret Manager in live mode). Raises RuntimeError if any is missing.
-    """
-    if _client_cache["client"] is not None and time.time() - _client_cache["ts"] < 600:
-        return _client_cache["client"]
-
-    missing = [
-        n for n, v in [
-            ("polymarket-pk (settings.polymarket_private_key)", _pk()),
-            ("polymarket-funder", settings.polymarket_funder_address),
-            ("polymarket-api-key", settings.polymarket_api_key),
-            ("polymarket-api-secret", settings.polymarket_api_secret),
-            ("polymarket-api-passphrase", settings.polymarket_api_passphrase),
-        ] if not v
-    ]
-    if missing:
-        raise RuntimeError(
-            f"Polymarket live trading requires these secrets in GCP Secret "
-            f"Manager: {missing}"
-        )
-
-    from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import ApiCreds
-    from py_clob_client.constants import POLYGON
-
-    creds = ApiCreds(
-        api_key=settings.polymarket_api_key,
-        api_secret=settings.polymarket_api_secret,
-        api_passphrase=settings.polymarket_api_passphrase,
-    )
-    client = ClobClient(
-        host=settings.polymarket_clob_base,
-        chain_id=POLYGON,
-        key=_pk(),
-        creds=creds,
-        signature_type=int(settings.polymarket_signature_type),  # 1 = POLY_PROXY (Magic Link)
-        funder=settings.polymarket_funder_address,
-    )
-    _client_cache["client"] = client
-    _client_cache["ts"] = time.time()
-    logger.info("py-clob-client initialised (live mode)")
-    return client
+_client_cache: dict = {"client": None, "ts": 0.0, "deposit_wallet": ""}
 
 
 def _pk() -> str:
@@ -108,6 +70,88 @@ def _pk() -> str:
     return ""
 
 
+def _derive_deposit_wallet() -> str:
+    """Compute the user's v2 deposit-wallet address from the EOA private
+    key. Deterministic CREATE2 derivation handled by the relayer SDK."""
+    cached = _client_cache.get("deposit_wallet")
+    if cached:
+        return cached
+    pk = _pk()
+    if not pk:
+        return ""
+    try:
+        from eth_account import Account
+        from py_builder_relayer_client.client import (
+            RelayClient as _Rc,  # noqa: F401  (kept for parity / future use)
+            derive as _derive_safe,
+            get_contract_config,
+        )
+        eoa = Account.from_key(pk).address
+        cfg = get_contract_config(137)  # Polygon mainnet
+        factory = cfg.safe_factory
+        dw = _derive_safe(eoa, factory)
+        _client_cache["deposit_wallet"] = dw
+        logger.info(f"deposit_wallet derived: EOA={eoa} → {dw} (factory={factory})")
+        return dw
+    except Exception as e:
+        logger.error(f"deposit_wallet derivation failed: {e}")
+        return ""
+
+
+def deposit_wallet_address() -> str:
+    """Public helper — exposes the derived deposit wallet so the wallet
+    snapshot writer can query its on-chain pUSD balance."""
+    return _derive_deposit_wallet()
+
+
+def _get_client():
+    """Lazily build (and cache) a ClobClient v2 instance.
+
+    Reads the 5 polymarket secrets from settings (which loads from GCP
+    Secret Manager in live mode). Raises RuntimeError if any is missing.
+    """
+    if _client_cache["client"] is not None and time.time() - _client_cache["ts"] < 600:
+        return _client_cache["client"]
+
+    missing = []
+    if not _pk():
+        missing.append("polymarket-pk")
+    if not settings.polymarket_api_key:
+        missing.append("polymarket-api-key")
+    if not settings.polymarket_api_secret:
+        missing.append("polymarket-api-secret")
+    if not settings.polymarket_api_passphrase:
+        missing.append("polymarket-api-passphrase")
+    dw = _derive_deposit_wallet()
+    if not dw:
+        missing.append("deposit-wallet (could not derive)")
+    if missing:
+        raise RuntimeError(
+            f"Polymarket live trading requires these secrets in GCP Secret "
+            f"Manager: {missing}"
+        )
+
+    from py_clob_client_v2 import ClobClient, ApiCreds, SignatureTypeV2
+
+    creds = ApiCreds(
+        api_key=settings.polymarket_api_key,
+        api_secret=settings.polymarket_api_secret,
+        api_passphrase=settings.polymarket_api_passphrase,
+    )
+    client = ClobClient(
+        host=settings.polymarket_clob_base,
+        chain_id=137,                       # Polygon
+        key=_pk(),
+        creds=creds,
+        signature_type=SignatureTypeV2.POLY_1271,
+        funder=dw,                          # v2 deposit wallet (NOT the old Magic Link proxy)
+    )
+    _client_cache["client"] = client
+    _client_cache["ts"] = time.time()
+    logger.info(f"py-clob-client-v2 initialised (live mode, deposit_wallet={dw})")
+    return client
+
+
 @dataclass(frozen=True)
 class OrderFill:
     success: bool
@@ -120,7 +164,7 @@ class OrderFill:
 
 def place_market_order(token_id: str, side: str, size_usd: float,
                         ask_price: float) -> OrderFill:
-    """Place a marketable limit order on Polymarket.
+    """Place a marketable FAK order on Polymarket v2.
 
     Args:
       token_id: CLOB token id for YES or NO
@@ -142,7 +186,9 @@ def place_market_order(token_id: str, side: str, size_usd: float,
                           {"error": f"bad ask price {ask_price}"})
 
     client = _get_client()
-    from py_clob_client.clob_types import OrderArgs, OrderType
+    from py_clob_client_v2 import (
+        OrderArgs, OrderType, PartialCreateOrderOptions, Side,
+    )
 
     # Limit slightly above the observed ask to take the offer — books move
     # in milliseconds at 5-min close so we want to be a maker-cross, not stale
@@ -153,28 +199,28 @@ def place_market_order(token_id: str, side: str, size_usd: float,
         token_id=token_id,
         price=limit_price,
         size=units,
-        side="BUY",
+        side=Side.BUY,
     )
     try:
-        signed = client.create_order(args)
-        # FAK = Fill-And-Kill: take whatever's available at our limit and
+        # create_and_post_order handles signing + POST atomically and
+        # internally resolves tick_size / neg_risk / fee for the market.
+        # FAK = Fill-And-Kill: take what's available at our limit and
         # cancel the rest. Prevents orders from lingering on the book
         # unfilled (the previous GTC choice caused phantom decisions —
         # bot recorded a "filled $11" trade while only $1 actually
         # matched, then settle_tick wrote fake P&L when the market
         # resolved on tape the bot never held).
-        resp = client.post_order(signed, OrderType.FAK)
+        resp = client.create_and_post_order(
+            order_args=args,
+            options=PartialCreateOrderOptions(tick_size="0.01"),
+            order_type=OrderType.FAK,
+        )
         resp = resp or {}
 
-        # Polymarket reports fill via makingAmount (USD spent by buyer)
-        # and takingAmount (shares received). Field semantics from
-        # py-clob-client docs: for a BUY order:
-        #   makingAmount = USD we paid
+        # v2 fill semantics: response includes makingAmount / takingAmount
+        # for what actually matched. For a BUY:
+        #   makingAmount = USD we spent
         #   takingAmount = shares we received
-        # Some versions of the API return zero for both even on
-        # success=true when the order matched 0 shares (i.e. queued but
-        # the matcher didn't fill any). Treat that as failure — there
-        # is no real position to track.
         try:
             paid_usd = float(resp.get("makingAmount") or 0.0)
         except (TypeError, ValueError):
@@ -184,9 +230,6 @@ def place_market_order(token_id: str, side: str, size_usd: float,
         except (TypeError, ValueError):
             shares = 0.0
 
-        # Real fill must move BOTH numbers. If either is zero, nothing
-        # actually traded — refuse to record as a successful fill so the
-        # caller bails and doesn't create a phantom decision row.
         truly_filled = paid_usd > 0.001 and shares > 0.001
         api_success = bool(resp.get("success"))
         success = api_success and truly_filled
@@ -227,11 +270,9 @@ def daily_loss_halts(realized_pnl_usd_today: float) -> bool:
 
 
 def live_readiness_check() -> tuple[bool, list[str]]:
-    """Confirm all 5 secrets are present and the SDK is importable.
+    """Confirm all 5 secrets are present and the v2 SDK is importable.
     Returns (ready, missing_list)."""
     missing = []
-    if not getattr(settings, "polymarket_funder_address", ""):
-        missing.append("polymarket-funder")
     if not getattr(settings, "polymarket_api_key", ""):
         missing.append("polymarket-api-key")
     if not getattr(settings, "polymarket_api_secret", ""):
@@ -241,7 +282,13 @@ def live_readiness_check() -> tuple[bool, list[str]]:
     if not _pk():
         missing.append("polymarket-pk")
     try:
-        import py_clob_client  # noqa: F401
+        import py_clob_client_v2  # noqa: F401
     except ImportError:
-        missing.append("py-clob-client (SDK not installed)")
+        missing.append("py-clob-client-v2 (SDK not installed)")
+    try:
+        import py_builder_relayer_client  # noqa: F401
+    except ImportError:
+        missing.append("py-builder-relayer-client (deposit-wallet helper not installed)")
+    if not _derive_deposit_wallet():
+        missing.append("deposit-wallet derivation failed")
     return (len(missing) == 0, missing)

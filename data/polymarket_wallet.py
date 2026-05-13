@@ -98,78 +98,115 @@ def _gcp_token() -> Optional[str]:
         return None
 
 
+def _addresses_of_interest() -> dict:
+    """Return both the v1 Magic Link proxy AND the v2 deposit wallet,
+    so the snapshot covers funds wherever they happen to live during
+    the migration period."""
+    addrs: dict = {
+        "legacy_proxy": getattr(settings, "polymarket_funder_address", "") or "",
+        "deposit_wallet": "",
+    }
+    try:
+        from execution.polymarket_orders import deposit_wallet_address
+        addrs["deposit_wallet"] = deposit_wallet_address() or ""
+    except Exception as e:
+        logger.debug(f"_addresses_of_interest: derive failed: {e}")
+    return addrs
+
+
 def _fetch_balance() -> dict:
     """Read the trading balance Polymarket actually uses today (pUSD).
 
-    Returns three signals so the dashboard / sizer can pick the right one:
-      • usdc       = LEGACY CLOB USDC.e collateral (almost always 0 today)
-      • pusd       = REAL trading capital, read on-chain from Polygon
-      • effective  = pusd if non-None else usdc (the value to size against)
+    Returns five signals so the dashboard / sizer can pick the right one:
+      • usdc           = LEGACY CLOB USDC.e collateral (~always 0 today)
+      • pusd_legacy    = pUSD on the OLD Magic Link proxy
+      • pusd_deposit   = pUSD on the NEW v2 deposit wallet
+      • pusd           = max(legacy, deposit)  — easiest "what we have"
+      • effective      = pusd_deposit if > 0 else pusd_legacy (the value
+                         actually usable for v2 trading; legacy funds
+                         can't trade until migrated)
     """
-    out: dict = {"raw": None, "usdc": None, "pusd": None, "effective": None}
-    # 1) Legacy USDC.e via the CLOB (kept for compatibility / debugging).
-    try:
-        from execution.polymarket_orders import _get_client
-        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
-        client = _get_client()
-        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-        resp = client.get_balance_allowance(params)
-        bal = resp.get("balance") if isinstance(resp, dict) else None
-        if bal is not None:
-            try:
-                bal = float(bal) / 1_000_000.0
-            except Exception:
-                pass
-        out["raw"] = resp
-        out["usdc"] = bal
-    except Exception as e:
-        logger.debug(f"_fetch_balance (CLOB USDC.e) failed: {e}")
-        out["error"] = str(e)[:200]
+    addrs = _addresses_of_interest()
+    out: dict = {
+        "raw": None, "usdc": None,
+        "pusd_legacy": None, "pusd_deposit": None,
+        "pusd": None, "effective": None,
+        "legacy_proxy": addrs.get("legacy_proxy"),
+        "deposit_wallet": addrs.get("deposit_wallet"),
+    }
 
-    # 2) Real pUSD ERC-20 balance from Polygon RPC.
+    # On-chain pUSD on both addresses
     try:
-        from config.settings import settings as _s
-        funder = getattr(_s, "polymarket_funder_address", "")
-        pusd = _fetch_pusd_balance(funder) if funder else None
-        out["pusd"] = pusd
+        if addrs.get("legacy_proxy"):
+            out["pusd_legacy"] = _fetch_pusd_balance(addrs["legacy_proxy"])
     except Exception as e:
-        logger.debug(f"_fetch_balance (pUSD on-chain) failed: {e}")
+        logger.debug(f"_fetch_balance (legacy pUSD) failed: {e}")
+    try:
+        if addrs.get("deposit_wallet"):
+            out["pusd_deposit"] = _fetch_pusd_balance(addrs["deposit_wallet"])
+    except Exception as e:
+        logger.debug(f"_fetch_balance (deposit pUSD) failed: {e}")
 
-    out["effective"] = out["pusd"] if out["pusd"] is not None else out["usdc"]
+    # Highest known balance — useful header on the dashboard
+    candidates = [v for v in (out["pusd_legacy"], out["pusd_deposit"]) if v is not None]
+    out["pusd"] = max(candidates) if candidates else None
+
+    # The v2 CLOB will only match orders backed by the deposit wallet.
+    # Legacy funds are "stuck" until the user migrates them via the
+    # Polymarket UI. effective = what the bot can actually deploy.
+    if out["pusd_deposit"] is not None and out["pusd_deposit"] > 0:
+        out["effective"] = out["pusd_deposit"]
+    elif out["pusd_legacy"] is not None:
+        out["effective"] = 0.0  # legacy funds exist but cannot trade on v2
+    else:
+        out["effective"] = None
+
     return out
 
 
 def _fetch_positions() -> list:
-    """Open positions for the funder. Public Data API (no auth needed)."""
-    funder = settings.polymarket_funder_address
-    if not funder:
-        return []
-    try:
-        url = f"{_data_api_base}/positions?user={funder}&sizeThreshold=0.01"
-        with httpx.Client(timeout=15.0) as c:
-            r = c.get(url)
-            r.raise_for_status()
-            data = r.json()
-            return data if isinstance(data, list) else []
-    except Exception as e:
-        logger.debug(f"_fetch_positions failed: {e}")
-        return []
+    """Open positions for the user — query BOTH the legacy proxy and
+    the v2 deposit wallet, since funds/positions can live in either
+    during the migration period."""
+    addrs = _addresses_of_interest()
+    out: list = []
+    for label, addr in addrs.items():
+        if not addr:
+            continue
+        try:
+            url = f"{_data_api_base}/positions?user={addr}&sizeThreshold=0.01"
+            with httpx.Client(timeout=15.0) as c:
+                r = c.get(url)
+                r.raise_for_status()
+                data = r.json()
+                if isinstance(data, list):
+                    # Tag each row so the dashboard can group v1 vs v2
+                    for p in data:
+                        if isinstance(p, dict):
+                            p["__source"] = label
+                    out.extend(data)
+        except Exception as e:
+            logger.debug(f"_fetch_positions[{label}] failed: {e}")
+    return out
 
 
 def _fetch_recent_trades(limit: int = 50) -> list:
-    """Recent fills for the user. Uses the authenticated CLOB endpoint."""
+    """Recent fills for the user. Uses the authenticated CLOB v2 endpoint."""
     try:
         from execution.polymarket_orders import _get_client
         client = _get_client()
-        # py-clob-client exposes get_trades — public method, takes optional params
-        try:
-            trades = client.get_trades(params={"limit": limit})
-        except TypeError:
-            trades = client.get_trades()
-        if isinstance(trades, list):
-            return trades[:limit]
-        if isinstance(trades, dict) and "data" in trades:
-            return trades["data"][:limit]
+        # v2 SDK exposes get_market_trades_events / open_orders etc;
+        # the historical trades endpoint may not be there yet. Best-
+        # effort: return empty list rather than raise.
+        if hasattr(client, "get_trades"):
+            try:
+                trades = client.get_trades(params={"limit": limit})
+            except TypeError:
+                trades = client.get_trades()
+            if isinstance(trades, list):
+                return trades[:limit]
+            if isinstance(trades, dict) and "data" in trades:
+                return trades["data"][:limit]
         return []
     except Exception as e:
         logger.debug(f"_fetch_recent_trades failed: {e}")
@@ -183,9 +220,15 @@ def write_wallet_snapshot():
     missing (so a fresh deployment without secrets doesn't error)."""
     if not (settings.polymarket_api_key and settings.polymarket_private_key):
         return  # not configured — skip silently
+    _addrs = _addresses_of_interest()
     snapshot = {
         "ts": datetime.utcnow().isoformat() + "Z",
-        "funder": settings.polymarket_funder_address,
+        # Keep "funder" for legacy dashboard compatibility — points at
+        # the v1 Magic Link proxy. New fields below expose both
+        # legacy and v2 deposit-wallet addresses explicitly.
+        "funder": _addrs.get("legacy_proxy"),
+        "legacy_proxy": _addrs.get("legacy_proxy"),
+        "deposit_wallet": _addrs.get("deposit_wallet"),
         "balance": _fetch_balance(),
         "positions": _fetch_positions(),
         "recent_trades": _fetch_recent_trades(limit=20),

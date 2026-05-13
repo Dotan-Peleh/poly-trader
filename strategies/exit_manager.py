@@ -113,7 +113,7 @@ def _resolve_paper_at_mid(decision_id: int, current_mid: float, reason: str
 def _live_sell(condition_id: str, side: str, units: float,
                 token_id_yes: str, token_id_no: str,
                 book) -> Optional[dict]:
-    """Place a live SELL on Polymarket via py-clob-client.
+    """Place a live SELL on Polymarket via py-clob-client-v2.
     For YES position: sell YES tokens at the current best bid.
     For NO position: sell NO tokens at the current best NO bid.
 
@@ -122,7 +122,9 @@ def _live_sell(condition_id: str, side: str, units: float,
     """
     try:
         from execution.polymarket_orders import _get_client
-        from py_clob_client.clob_types import OrderArgs, OrderType
+        from py_clob_client_v2 import (
+            OrderArgs, OrderType, PartialCreateOrderOptions, Side,
+        )
 
         # Choose token + price
         if side == "YES":
@@ -138,11 +140,16 @@ def _live_sell(condition_id: str, side: str, units: float,
         cross_price = round(max(limit_price - 0.005, 0.005), 3)
         client = _get_client()
         args = OrderArgs(token_id=token_id, price=cross_price,
-                          size=round(units, 4), side="SELL")
-        signed = client.create_order(args)
-        # FAK so an unfilled SELL doesn't sit on the book waiting; we'd
-        # rather know now that we couldn't exit and try again next tick.
-        resp = client.post_order(signed, OrderType.FAK)
+                          size=round(units, 4), side=Side.SELL)
+        # create_and_post_order signs + POSTs atomically; v2 resolves
+        # tick_size/neg_risk/fee internally. FAK so an unfilled SELL
+        # doesn't sit on the book — we'd rather know now and try again
+        # next tick.
+        resp = client.create_and_post_order(
+            order_args=args,
+            options=PartialCreateOrderOptions(tick_size="0.01"),
+            order_type=OrderType.FAK,
+        )
         resp = resp or {}
 
         # SELL fill semantics (mirror BUY in polymarket_orders.py):

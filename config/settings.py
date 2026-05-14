@@ -3,7 +3,7 @@ Pydantic settings + live-mode safety gates.
 Mirrors crypto-trader's pattern but scoped to binary-options trading.
 """
 import logging
-from typing import Literal
+from typing import Literal, Optional
 from pydantic_settings import BaseSettings
 
 logger = logging.getLogger(__name__)
@@ -127,6 +127,13 @@ class Settings(BaseSettings):
     # Decisions land in the DB with notes='v2_momentum' so we can A/B
     # the inverted run against the historical v2_meanrev rows.
     pre_window_invert_side: bool = True
+    # During the v2_momentum experiment, lower the edge-min so we get
+    # enough fires per day to validate the contrarian hypothesis. The
+    # historical 4% gate (settings.edge_threshold) is too strict for
+    # calm BTC tapes — entire hours can go by with zero qualifying
+    # markets. 2.5% gives ~3x the fire rate while still being meaningful
+    # above noise. Set to None to fall back to the global threshold.
+    pre_window_edge_min_override: Optional[float] = 0.025
 
     polymarket_funder_address: str = ""    # the proxy/Safe wallet address, NOT your EOA
     # v2 deposit-wallet address (where the CLOB v2 matcher accepts orders

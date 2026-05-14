@@ -36,12 +36,20 @@ class Wallet:
         self.mode = mode or settings.trading_mode
 
     def realized_pnl(self) -> float:
-        """Sum pnl_usd across all RESOLVED decisions in this mode."""
+        """Sum pnl_usd across all RESOLVED decisions in this mode.
+
+        When the pre_window inversion experiment is active, exclude
+        v2_meanrev (anti-predictive) decisions so they don't drag the
+        bankroll into negative and silently kill Kelly sizing on the
+        new v2_momentum strategy.
+        """
         with Session(engine) as session:
-            rows = (session.query(Decision.pnl_usd)
-                    .filter(Decision.mode == self.mode,
-                            Decision.pnl_usd.isnot(None))
-                    .all())
+            q = (session.query(Decision.pnl_usd)
+                 .filter(Decision.mode == self.mode,
+                         Decision.pnl_usd.isnot(None)))
+            if getattr(settings, "pre_window_invert_side", False):
+                q = q.filter(~Decision.notes.like("%v2_meanrev%"))
+            rows = q.all()
         return float(sum(r[0] for r in rows if r[0] is not None))
 
     def open_capital_at_risk(self) -> float:

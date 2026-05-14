@@ -248,8 +248,6 @@ def evaluate_market(
 
     # Reject placeholder books — both asks at 0.99 means no real ask-side liquidity
     if yes_ask + no_ask > MAX_PLACEHOLDER_SUM:
-        logger.debug(f"[{market.condition_id}] placeholder book "
-                      f"(yes_ask+no_ask={yes_ask+no_ask:.3f})")
         return None
 
     # Implied YES probability via mid (averaging removes the spread)
@@ -277,8 +275,12 @@ def evaluate_market(
     )
 
     edge = sig.fair_yes_prob - implied_yes
-    # Lower bound: need at least edge_threshold (4%) to overcome fees + noise
-    if abs(edge) < settings.edge_threshold:
+    # Lower bound: need at least edge_threshold (4%) to overcome fees + noise.
+    # For the v2_momentum experiment we lower this to gather data faster.
+    _edge_min = getattr(settings, "pre_window_edge_min_override", None)
+    if _edge_min is None:
+        _edge_min = settings.edge_threshold
+    if abs(edge) < _edge_min:
         return None
     # Upper bound: when our model disagrees too much with the market, the
     # market is almost always right. First v2 fire: implied=0.34 (market

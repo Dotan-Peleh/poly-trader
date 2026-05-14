@@ -133,7 +133,12 @@ class Settings(BaseSettings):
     # calm BTC tapes — entire hours can go by with zero qualifying
     # markets. 2.5% gives ~3x the fire rate while still being meaningful
     # above noise. Set to None to fall back to the global threshold.
-    pre_window_edge_min_override: Optional[float] = 0.025
+    # Was 0.025 (2.5%) during the initial data-gathering phase. Raised to
+    # 0.04 (4%) once we had ~60 fires at 50.8% WR — the lowered threshold
+    # was bringing in marginal-edge signals that diluted the contrarian
+    # effect. At 4% we only fire on high-conviction reversion signals,
+    # where v2_meanrev was 0% WR (i.e. they should flip cleanest).
+    pre_window_edge_min_override: Optional[float] = 0.04
 
     polymarket_funder_address: str = ""    # the proxy/Safe wallet address, NOT your EOA
     # v2 deposit-wallet address (where the CLOB v2 matcher accepts orders

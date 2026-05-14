@@ -67,7 +67,22 @@ TAIL_FILTER_HI = 0.90        # don't pay > $0.90 on a side (deep tail)
 # Consecutive-loss cooldown (risk management, no martingale)
 COOLDOWN_3_LOSSES_HOURS = 1.0
 COOLDOWN_5_LOSSES_HOURS = 6.0
-STRATEGY_TAG = "v2_meanrev"  # written to Decision.notes for A/B split
+STRATEGY_TAG_BASE = "v2_meanrev"   # what the reversion model would say
+STRATEGY_TAG_INVERTED = "v2_momentum"  # opposite side — used when invert flag is on
+
+
+def _strategy_tag() -> str:
+    """Resolve the strategy tag at fire time based on the runtime flag."""
+    try:
+        from config.settings import settings as _s
+        return STRATEGY_TAG_INVERTED if getattr(_s, "pre_window_invert_side", False) else STRATEGY_TAG_BASE
+    except Exception:
+        return STRATEGY_TAG_BASE
+
+
+# Back-compat shim: other modules import STRATEGY_TAG by name. Keep it as
+# the BASE value at import time; the live-fire path uses _strategy_tag().
+STRATEGY_TAG = STRATEGY_TAG_BASE
 # When implied is far from 0.50, the market has information we don't.
 # Cap on |edge| above this means our model is fighting a screaming market —
 # almost always the model is wrong (first v2 fire: paid 0.34, fair 0.525,
@@ -281,6 +296,27 @@ def evaluate_market(
         return None
 
     side = "YES" if edge > 0 else "NO"
+    # ── Side inversion (anti-predictive contrarian flip) ──
+    # The reversion model was empirically anti-predictive (27% WR on 593
+    # paper trades over May 12, vs 69% if you flipped every side). When
+    # the flag is on, we fire the OPPOSITE side. Kelly sizing still works
+    # because size_trade reads model_yes_prob and figures out the side
+    # internally — but to keep sizing consistent with our actual bet, we
+    # also invert model_yes_prob (so size_trade is told the probability
+    # of OUR side winning, not the reversion model's).
+    from config.settings import settings as _s
+    if getattr(_s, "pre_window_invert_side", False):
+        side = "NO" if side == "YES" else "YES"
+        edge = -edge
+        # Replace sig with an inverted-prob version so the rest of the
+        # function uses consistent values without mutating the original.
+        sig = Signal(
+            fair_yes_prob=1.0 - sig.fair_yes_prob,
+            reversion_bias=sig.reversion_bias,
+            imbalance_bias=sig.imbalance_bias,
+            btc_15min_return=sig.btc_15min_return,
+            sigma_15min=sig.sigma_15min,
+        )
     side_ask = yes_ask if side == "YES" else no_ask
     if side_ask < TAIL_FILTER_LO or side_ask > TAIL_FILTER_HI:
         logger.info(f"[{market.condition_id}] tail-filter: skipping {side} "
@@ -308,8 +344,75 @@ def evaluate_market(
     if final_size < 1.0:
         return None
 
-    # Live mode would add safety checks here; pre_window v1 is paper-only by
-    # default (live can be enabled via existing effective_mode() gate later).
+    # ── Live execution branch — mirrors late_window.evaluate_market ──
+    # Without this, pre_window in 'live' mode would write phantom 'live'
+    # decision rows that never moved real pUSD (the source of the
+    # 6-fire $101-of-nothing batch that confused everyone today).
+    from monitor.halt_flag import effective_mode as _eff_mode
+    is_live = (_eff_mode() == "live")
+    fill_units = sizing.units
+    fill_price = sizing.paid_per_unit
+    fill_size = final_size
+    mode_row = "paper"
+
+    if is_live:
+        try:
+            from data.polymarket_wallet import _fetch_balance
+            real_bal = _fetch_balance() or {}
+            real_avail = float(real_bal.get("effective") or 0.0)
+        except Exception as e:
+            logger.warning(f"pre_window: live balance fetch failed: {e}; "
+                            "refusing live order")
+            return None
+        if real_avail < 1.0:
+            logger.info(f"[{market.condition_id}] live skipped: real pUSD ${real_avail:.2f}")
+            return None
+        max_real = round(real_avail * 0.95, 2)
+        if final_size > max_real:
+            logger.info(f"[{market.condition_id}] live size capped {final_size:.2f}→{max_real:.2f}")
+            final_size = max_real
+        from execution.polymarket_orders import (
+            place_market_order, cap_for_smoke_period, daily_loss_halts,
+        )
+        from execution.wallet import Wallet as _W
+        today_real_pnl = _W().realized_pnl()
+        if daily_loss_halts(today_real_pnl):
+            logger.info(f"pre_window: SKIP daily-loss halt at ${today_real_pnl:+.2f}")
+            return None
+        bot_started = getattr(evaluate_market, "_bot_started_at", datetime.utcnow())
+        evaluate_market._bot_started_at = bot_started
+        capped = cap_for_smoke_period(final_size, bot_started)
+        if capped < final_size:
+            logger.info(f"[{market.condition_id}] smoke-cap {final_size:.2f}→{capped:.2f}")
+            final_size = capped
+        if final_size < 1.0:
+            return None
+        token_id = market.yes_token_id if side == "YES" else market.no_token_id
+        if not token_id:
+            logger.warning(f"[{market.condition_id}] missing {side} token id — cannot fire live")
+            return None
+        our_ask = yes_ask if side == "YES" else no_ask
+        fill = place_market_order(token_id, side, final_size, our_ask)
+        if not fill.success:
+            err = fill.raw_response.get("error", "no fill")
+            status = fill.raw_response.get("status")
+            if notifier:
+                notifier.send(
+                    f"❌ <b>PRE-WINDOW LIVE failed</b> on {side} "
+                    f"<code>{market.condition_id[:24]}…</code>\n"
+                    f"💡 {err[:160]} status={status}"
+                )
+            return None
+        fill_units = fill.units
+        fill_price = fill.paid_per_unit
+        fill_size = round(fill.size_usd, 4)
+        if fill_size < final_size * 0.99:
+            logger.info(
+                f"[{market.condition_id}] PARTIAL FILL requested ${final_size:.2f} "
+                f"filled ${fill_size:.2f} ({fill_units:.2f}@{fill_price:.3f})"
+            )
+        mode_row = "live"
+
     btc_now = latest_btc_price() or 0.0
 
     decision_id = record_paper_trade(
@@ -322,8 +425,9 @@ def evaluate_market(
         model_yes_prob=sig.fair_yes_prob,
         implied_yes_prob=implied_yes,
         edge=edge,
-        size_usd=final_size,
-        paid_per_unit=sizing.paid_per_unit,
+        size_usd=fill_size,
+        paid_per_unit=fill_price,
+        mode_override=mode_row,
     )
 
     # Tag the row so the summary can A/B v1 vs v2 cleanly
@@ -332,7 +436,7 @@ def evaluate_market(
         with Session(engine) as session:
             session.execute(
                 update(Decision).where(Decision.id == decision_id)
-                .values(notes=STRATEGY_TAG)
+                .values(notes=_strategy_tag())
             )
             session.commit()
     except Exception as e:
@@ -348,7 +452,7 @@ def evaluate_market(
         from strategies.cumulative import mode_tag
         _mt = mode_tag()
         notifier.send(
-            f"{icon} <b>[{_mt}] {side} fired ({STRATEGY_TAG})</b> "
+            f"{icon} <b>[{_mt}] {side} fired ({_strategy_tag()})</b> "
             f"<code>{market.condition_id[:24]}...</code>\n"
             f"📊 fair={sig.fair_yes_prob*100:.1f}% vs implied={implied_yes*100:.1f}%\n"
             f"💸 edge={edge*100:+.1f}% | size=${final_size:.2f} "

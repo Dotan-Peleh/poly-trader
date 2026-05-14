@@ -39,11 +39,19 @@ class PortfolioGuard:
     def daily_realized_pnl(self) -> float:
         cutoff = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         with Session(engine) as session:
-            rows = (session.query(Decision.pnl_usd)
-                    .filter(Decision.mode == settings.trading_mode,
-                            Decision.resolved_at >= cutoff,
-                            Decision.pnl_usd.isnot(None))
-                    .all())
+            q = (session.query(Decision.pnl_usd)
+                 .filter(Decision.mode == settings.trading_mode,
+                         Decision.resolved_at >= cutoff,
+                         Decision.pnl_usd.isnot(None)))
+            # When pre_window is in the inverted-momentum experiment, the
+            # circuit breaker should NOT count losses from the OLD
+            # anti-predictive v2_meanrev rows — they don't represent what
+            # the current strategy would do. Scoping the daily budget to
+            # the active strategy's tag prevents the breaker from
+            # tripping the experiment before it gets a fair chance.
+            if getattr(settings, "pre_window_invert_side", False):
+                q = q.filter(~Decision.notes.like("%v2_meanrev%"))
+            rows = q.all()
         return float(sum(r[0] for r in rows if r[0] is not None))
 
     def circuit_breaker_triggered(self) -> bool:

@@ -120,7 +120,22 @@ class Settings(BaseSettings):
     polymarket_api_key: str = ""
     polymarket_api_secret: str = ""
     polymarket_api_passphrase: str = ""
+    # Empirical: 7-day paper data showed pre_window.v2_meanrev firing the
+    # WRONG side 73% of the time (anti-predictive — flipping every side
+    # would yield ~69% WR). Setting this True turns the strategy into
+    # v2_momentum: fire the opposite of what the reversion model picks.
+    # Decisions land in the DB with notes='v2_momentum' so we can A/B
+    # the inverted run against the historical v2_meanrev rows.
+    pre_window_invert_side: bool = True
+
     polymarket_funder_address: str = ""    # the proxy/Safe wallet address, NOT your EOA
+    # v2 deposit-wallet address (where the CLOB v2 matcher accepts orders
+    # from). Polymarket shows this in the Portfolio → Deposit → Transfer
+    # Crypto modal. NOT deterministically derivable from the EOA via the
+    # standard safe-factory CREATE2; Polymarket uses a custom flow whose
+    # factory parameters aren't documented. Configure via Secret Manager
+    # under `polymarket-deposit-wallet`.
+    polymarket_deposit_wallet: str = ""
     polymarket_private_key: str = ""       # NEVER store in plaintext settings; loaded
                                             # from Secret Manager at runtime in live mode
     # Signature type for the ClobClient:
@@ -217,6 +232,7 @@ if settings.trading_mode == "live":
         ("polymarket_api_secret", "polymarket-api-secret"),
         ("polymarket_api_passphrase", "polymarket-api-passphrase"),
         ("polymarket_funder_address", "polymarket-funder"),
+        ("polymarket_deposit_wallet", "polymarket-deposit-wallet"),
         ("polymarket_private_key", "polymarket-pk"),
     ]:
         if not getattr(settings, fld):

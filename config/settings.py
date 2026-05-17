@@ -138,7 +138,12 @@ class Settings(BaseSettings):
     # was bringing in marginal-edge signals that diluted the contrarian
     # effect. At 4% we only fire on high-conviction reversion signals,
     # where v2_meanrev was 0% WR (i.e. they should flip cleanest).
-    pre_window_edge_min_override: Optional[float] = 0.04
+    # 2026-05-17: raised 0.04 → 0.07 after diagnosing why paper WR is 31%.
+    # Friction per round-trip: 1 full spread (~2%) + 2× 1% fee = ~4%. The
+    # old 0.04 gate was EXACTLY at the friction limit, so every trade with
+    # positive model-edge was eaten by execution costs. 0.07 leaves 3pp
+    # net edge after friction — small but real.
+    pre_window_edge_min_override: Optional[float] = 0.07
 
     polymarket_funder_address: str = ""    # the proxy/Safe wallet address, NOT your EOA
     # v2 deposit-wallet address (where the CLOB v2 matcher accepts orders

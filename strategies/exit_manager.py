@@ -41,6 +41,11 @@ STOP_LOSS_RATIO = 0.5        # mid / cost ≤ 0.5 → cap loss
 EDGE_FLIP_THRESHOLD = -0.04  # model says edge has flipped -4% against us
 TIME_LEFT_BAILOUT_SEC = 120  # in red + <2 min left → bail
 MIN_HOLD_SECONDS = 30        # don't churn — must hold ≥30s before exit
+# 2026-05-17 fix: only time-bail when actually losing past structural
+# half-spread cost. Trades are born at pnl_pct = -spread/2 (entry at ask,
+# exit-side value at mid/bid). Bailing at pnl_pct < 0 guaranteed-lost
+# every flat trade. -3% is roughly 1.5x typical Polymarket spread.
+TIME_BAILOUT_LOSS_FLOOR = -0.03
 
 
 @dataclass
@@ -63,11 +68,24 @@ def _latest_book(condition_id: str) -> Optional[PolymarketBookSnapshot]:
                 .first())
 
 
-def _resolve_paper_at_mid(decision_id: int, current_mid: float, reason: str
+def _resolve_paper_at_mid(decision_id: int, current_mid: float, reason: str,
+                          bid_price: Optional[float] = None
                           ) -> Optional[dict]:
-    """Mark a paper decision as resolved at the current mid (early exit).
-    The pnl is units × current_mid − size_usd − fees."""
+    """Mark a paper decision as resolved (early exit).
+
+    REAL EXECUTION PRICES IT AT THE BID, NOT THE MID. Previously this priced
+    at mid, which over-estimated paper P&L by half-spread per trade — every
+    flat trade was actually a structural -spread loss in reality. Pass
+    bid_price=actual_bid when caller has it; falls back to current_mid for
+    backward compat (with a logged warning so we notice).
+    """
     PAPER_FEE_RATE = 0.01
+    if bid_price is None:
+        logger.warning(
+            f"_resolve_paper_at_mid: caller did not supply bid_price for "
+            f"decision_id={decision_id}, falling back to mid (over-estimates P&L)"
+        )
+        bid_price = current_mid
     with Session(engine) as session:
         d = session.get(Decision, decision_id)
         if d is None or d.resolution_yes is not None:
@@ -75,11 +93,17 @@ def _resolve_paper_at_mid(decision_id: int, current_mid: float, reason: str
         units = float(d.units_bought or 0)
         size = float(d.size_usd or 0)
         side = d.side
+        # YES position resolves at the YES bid; NO position at the NO bid.
+        # For YES: NO bid is (1 - yes_ask), so YES sell goes at yes_bid.
+        # For NO: NO sell goes at no_bid = (1 - yes_ask).
+        # The caller knows which bid to pass.
         if side == "YES":
-            proceeds = units * current_mid
+            proceeds = units * bid_price
         else:
-            # NO position: we own NO tokens worth (1-yes_mid) per share
-            proceeds = units * (1 - current_mid)
+            # NO position: caller passes the NO bid directly via bid_price.
+            # If bid_price was passed as current_mid (back-compat fallback),
+            # this still over-estimates by half a spread.
+            proceeds = units * bid_price
         fee = size * PAPER_FEE_RATE
         pnl_usd = proceeds - size - fee
 
@@ -220,16 +244,24 @@ def evaluate_open_positions(notifier=None) -> int:
                 book = _latest_book(d.condition_id)
                 if not book or book.yes_bid is None or book.yes_ask is None:
                     continue
-                yes_mid = (float(book.yes_bid) + float(book.yes_ask)) / 2.0
+                yes_bid_q = float(book.yes_bid)
+                yes_ask_q = float(book.yes_ask)
+                yes_mid = (yes_bid_q + yes_ask_q) / 2.0
+                no_bid_q = float(book.no_bid) if book.no_bid is not None else (1.0 - yes_ask_q)
 
-                # Compute current value vs cost
+                # Compute current value vs cost — PRICE AT THE BID, not the
+                # mid (a real sell hits the bid). The previous mid-based
+                # math over-estimated paper P&L by half a spread per trade,
+                # which guaranteed every flat position was already in the red.
                 cost = float(d.paid_per_unit or 0)
                 if cost <= 0:
                     continue
                 if d.side == "YES":
-                    cur_per_share = yes_mid
+                    cur_per_share = yes_bid_q   # YES sell → hits YES bid
+                    exit_bid = yes_bid_q
                 else:
-                    cur_per_share = 1.0 - yes_mid
+                    cur_per_share = no_bid_q    # NO sell → hits NO bid
+                    exit_bid = no_bid_q
                 ratio = cur_per_share / cost if cost else 0
                 pnl_pct = (cur_per_share - cost) / cost if cost else 0
 
@@ -240,7 +272,10 @@ def evaluate_open_positions(notifier=None) -> int:
                 elif ratio <= STOP_LOSS_RATIO:
                     exit_reason = f"sl_{ratio:.2f}x"
                 elif (seconds_to_close < TIME_LEFT_BAILOUT_SEC
-                       and pnl_pct < 0):
+                       and pnl_pct < TIME_BAILOUT_LOSS_FLOOR):
+                    # Only bail when actually losing past structural half-spread
+                    # cost. Trades born at pnl_pct ≈ -spread/2; bailing at <0
+                    # used to lock in that structural loss on every flat trade.
                     exit_reason = f"time_bailout_{seconds_to_close:.0f}s"
 
                 if not exit_reason:
@@ -287,8 +322,10 @@ def evaluate_open_positions(notifier=None) -> int:
                     session.commit()
                     result = {"pnl_usd": pnl_usd, "proceeds": proceeds}
                 else:
-                    # Paper path unchanged
-                    result = _resolve_paper_at_mid(d.id, yes_mid, exit_reason)
+                    # Paper path — now pass the actual BID we'd hit so
+                    # proceeds = units × bid (matches real execution).
+                    result = _resolve_paper_at_mid(d.id, yes_mid, exit_reason,
+                                                    bid_price=exit_bid)
 
                 if result and notifier:
                     icon = "🎯" if result["pnl_usd"] > 0 else "🔴"

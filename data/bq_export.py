@@ -70,6 +70,25 @@ def _df_to_bigquery(client, df: pd.DataFrame, table: str) -> int:
     for col in df.columns:
         if pd.api.types.is_datetime64_any_dtype(df[col]):
             df[col] = pd.to_datetime(df[col], errors="coerce").astype(str)
+    # Force-coerce known-string columns to str so autodetect doesn't infer
+    # them as FLOAT64. condition_id and 0xWALLET addresses look numeric in
+    # rare cases (all-hex-digit substrings) and the autodetector picks the
+    # narrowest type. condition_id storing wallets via FLOAT64 loses
+    # precision past 2^53 — symptoms observed in production exports
+    # (2026-05-19).
+    _STRING_COLS = {
+        "condition_id", "source_wallet", "wallet", "tx_hash", "pseudonym",
+        "strategy", "decision_outcome", "edge_definition", "side", "mode",
+        "notes", "reject_reason", "reject_detail", "asset_id",
+        "yes_token_id", "no_token_id", "category", "question",
+    }
+    for col in df.columns:
+        if col in _STRING_COLS:
+            # Convert to nullable string: NaN → empty string for now, then
+            # the _clean() helper below maps empty-or-NaN back to None
+            # before serialization.
+            df[col] = df[col].where(pd.notna(df[col]), None).astype("object")
+            df[col] = df[col].apply(lambda v: None if v is None else str(v))
     job_config = bigquery.LoadJobConfig(
         write_disposition="WRITE_TRUNCATE",
         autodetect=True,

@@ -71,18 +71,39 @@ def _pk() -> str:
 
 
 def _derive_deposit_wallet() -> str:
-    """Compute the user's v2 deposit-wallet address from the EOA private
-    key. Deterministic CREATE2 derivation handled by the relayer SDK."""
+    """Return the user's v2 deposit-wallet address.
+
+    Source order:
+      1. settings.polymarket_deposit_wallet (loaded from Secret Manager
+         under `polymarket-deposit-wallet` — this is what Polymarket's
+         own UI shows under Portfolio → Deposit → Transfer Crypto, and
+         is authoritative).
+      2. CREATE2 derivation via the relayer SDK (works only if
+         Polymarket actually uses the safe-factory we look up via
+         get_contract_config — empirically, they don't always).
+
+    For the current Polymarket V2 flow the configured secret is the
+    only reliable source. The CREATE2 path is kept as a fallback for
+    new accounts where we haven't captured the address yet.
+    """
     cached = _client_cache.get("deposit_wallet")
     if cached:
         return cached
+
+    # 1) Configured address (authoritative — copied from Polymarket UI)
+    configured = getattr(settings, "polymarket_deposit_wallet", "") or ""
+    if configured:
+        _client_cache["deposit_wallet"] = configured
+        logger.info(f"deposit_wallet from Secret Manager: {configured}")
+        return configured
+
+    # 2) Fallback: best-effort CREATE2 derivation
     pk = _pk()
     if not pk:
         return ""
     try:
         from eth_account import Account
         from py_builder_relayer_client.client import (
-            RelayClient as _Rc,  # noqa: F401  (kept for parity / future use)
             derive as _derive_safe,
             get_contract_config,
         )
@@ -91,7 +112,13 @@ def _derive_deposit_wallet() -> str:
         factory = cfg.safe_factory
         dw = _derive_safe(eoa, factory)
         _client_cache["deposit_wallet"] = dw
-        logger.info(f"deposit_wallet derived: EOA={eoa} → {dw} (factory={factory})")
+        logger.warning(
+            f"deposit_wallet derived via CREATE2 fallback: EOA={eoa} → {dw}. "
+            "If Polymarket rejects orders with 'maker address not allowed', "
+            "copy the correct address from polymarket.com → Portfolio → "
+            "Deposit → Transfer Crypto and add to Secret Manager under "
+            "`polymarket-deposit-wallet`."
+        )
         return dw
     except Exception as e:
         logger.error(f"deposit_wallet derivation failed: {e}")

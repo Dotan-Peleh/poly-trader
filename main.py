@@ -1,15 +1,19 @@
 """
 poly-trader main orchestrator.
 
-Phase 1 ticks:
+Active ticks:
   • binance_ws.run_forever (background thread) — 1s BTC ticks → DB
   • polymarket_refresh_tick (every 2 min) — refresh active hourly markets
-  • polymarket_book_tick (every 30s) — snapshot order books for active markets
+  • polymarket_book_tick (every 20s) — snapshot order books for markets in window
   • reference_backfill_tick (every 5 min) — fill in reference prices for new markets
+  • exit_manager_tick (every 10s) — TP/SL/time-bailout for open positions
+  • settle_tick (every 60s) — resolve closed markets, ping Telegram on win/loss
+  • smart_money refresh_tick (12h) + poll_tick (30s) — copy top wallets
+  • firehose_ingest (60s) + firehose_rank (15m) — discover new smart money
   • heartbeat_tick (every 5 min) — GCS heartbeat for watchdog
+  • bq_export_tick (daily 00:30 UTC) — push analytics to BigQuery
 
-Phase 2+ ticks (placeholders, wired but no logic yet):
-  • decision_tick (every 5s during last 15min of each hourly market)
+Retired strategies: v2_meanrev (pre_window). See STRATEGY_HISTORY.md.
 """
 import argparse
 import logging
@@ -122,24 +126,6 @@ def wallet_snapshot_tick():
         write_wallet_snapshot()
     except Exception as e:
         logger.error(f"wallet_snapshot_tick failed: {e}")
-
-
-def decision_tick(notifier: Notifier):
-    """Phase 2 v2: pre-window strategy. Fires BEFORE the 5-min measurement
-    window opens, when books are at ~50/50 with real depth. See
-    strategies/pre_window.py for the full thesis."""
-    if is_halted():
-        return
-    try:
-        from strategies.pre_window import decision_tick_impl
-        # claude_gate is wired for late_window's signature; pre_window v1
-        # ignores it (passes None). v2 will adapt the gate to use signal
-        # decomposition instead of vol-based BinaryQuote.
-        n = decision_tick_impl(notifier=notifier, claude_gate=None)
-        if n:
-            logger.info(f"decision_tick: fired {n} paper trade(s)")
-    except Exception as e:
-        logger.error(f"decision_tick failed: {e}")
 
 
 def settle_tick(notifier: Notifier):
@@ -372,20 +358,11 @@ def main():
                        id="polymarket_book")
     scheduler.add_job(reference_backfill_tick, "interval", minutes=5,
                        id="reference_backfill")
-    # ── v2_meanrev HALTED 2026-05-19 (post-execution-fix validation) ─────
-    # The 2026-05-17 execution-cost fix delivered its predicted change in
-    # fire rate (8.0→5.0/hr, −37.5%) but DID NOT unlock the edge:
-    #   POST paper (n=200, 40h): WR 38.0%, Wilson 95% CI [31.6%, 44.9%].
-    #   Fee-adjusted breakeven = 51.0%. CI ceiling 6pp below breakeven →
-    #   strategy is statistically losing at 95% confidence even AFTER fix.
-    # Calibration gap on the 0.50–0.60 bucket: 19.7pp → 17.8pp (negligible).
-    # Conclusion: the problem is MODEL CALIBRATION, not execution friction.
-    # exit_manager_tick + settle_tick stay enabled so open v2 positions
-    # resolve cleanly. Smart-money copy continues with per-wallet caps.
-    # Re-enable: uncomment after recalibrating model_yes_prob (isotonic /
-    # Platt fit on 0.50–0.60 bucket where 95% of v2 trades live).
-    # scheduler.add_job(decision_tick, "interval", seconds=5,
-    #                    args=[notifier], id="decision_tick")
+    # v2_meanrev (pre_window) RETIRED 2026-05-19 — see STRATEGY_HISTORY.md.
+    # Archived to strategies/_archived/pre_window.py. The strategy itself
+    # had no discrimination (200/200 trades in the 0.50-0.60 bucket post-
+    # execution-fix), so recalibration could not extract edge — only
+    # smart_money copy fires now.
     scheduler.add_job(exit_manager_tick, "interval", seconds=10,
                        args=[notifier], id="exit_manager_tick")
     scheduler.add_job(settle_tick, "interval", seconds=60,
@@ -512,13 +489,12 @@ def main():
     # to validate the 2026-05-17 execution-cost fix (predicted WR 31% → 45-55%).
     # If post-resume rigor check shows WR still <45% at n≥50, halt v2.
     notifier.send(
-        "⛔ <b>v2_meanrev HALTED + smart_money caps active</b>\n"
-        "Post-fix data (paper, n=200, 40h): WR 38%, Wilson CI [31.6, 44.9], "
-        "breakeven 51% — CI ceiling 6pp below breakeven. "
-        "Execution-cost fix cut fire rate as predicted but did NOT unlock "
-        "edge. Problem is model calibration (17.8pp overconfident).\n"
-        "✅ smart_money still firing with per-wallet caps (3/$50 per day)\n"
-        "🔄 exit_manager + settle keep running for open v2 positions"
+        "🪦 <b>v2_meanrev RETIRED — smart_money only</b>\n"
+        "Strategy had no discrimination (200/200 trades fell in the "
+        "0.50–0.60 bucket post-execution-fix), so recalibration could "
+        "not extract edge. Archived to strategies/_archived/.\n"
+        "✅ smart_money active with per-wallet caps (3 copies / $50 / day)\n"
+        "📊 rejected_decisions + calibration dashboard tracking everything"
     )
 
     try:

@@ -1,4 +1,25 @@
 """
+RETIRED 2026-05-19 — see STRATEGY_HISTORY.md.
+
+Final state at retirement:
+  • POST-execution-fix paper (n=200, 40h): WR 38.0%, Wilson 95% CI
+    [31.6%, 44.9%], fee-adjusted breakeven 51.0%. CI ceiling 6pp
+    below breakeven → statistically losing at 95%.
+  • All 200/200 trades fell in the model_our_side 0.50-0.60 bucket
+    (model output was essentially a constant ~0.55). With no
+    discrimination, recalibration cannot extract edge — it would
+    only shift the constant.
+  • The decision_tick scheduler job was removed from main.py at
+    retirement. This module is no longer imported by the live bot.
+
+Kept for: post-hoc backtests against historical `decisions` rows
+tagged `strategy='v2_meanrev'`, and as a reference implementation
+if a future strategy wants to fire in the pre-window with a
+different (discriminating) signal.
+
+────────────────────────────────────────────────────────────────────
+Original module docstring follows:
+
 Pre-window decision engine — Phase 2 v2.
 
 The previous strategy (late_window.py) tried to fire in the LAST few minutes

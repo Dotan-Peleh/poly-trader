@@ -89,11 +89,55 @@ def _df_to_bigquery(client, df: pd.DataFrame, table: str) -> int:
             # before serialization.
             df[col] = df[col].where(pd.notna(df[col]), None).astype("object")
             df[col] = df[col].apply(lambda v: None if v is None else str(v))
-    job_config = bigquery.LoadJobConfig(
-        write_disposition="WRITE_TRUNCATE",
-        autodetect=True,
-        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
-    )
+    # Explicit schema for known-string columns when the table has them.
+    # Why not rely on autodetect: BQ samples the first ~100 rows of the
+    # JSONL and infers per-column type. v2_meanrev rows (which have NULL
+    # source_wallet) come first in insertion order — autodetect saw mostly
+    # nulls and fell back to FLOAT64 for source_wallet AND condition_id.
+    # Providing an explicit schema for the columns that actually matter
+    # (string IDs) forces STRING and bypasses the autodetect trap.
+    _TABLE_SCHEMAS = {
+        "decisions": [
+            ("condition_id", "STRING"), ("source_wallet", "STRING"),
+            ("strategy", "STRING"), ("decision_outcome", "STRING"),
+            ("edge_definition", "STRING"), ("notes", "STRING"),
+            ("side", "STRING"), ("mode", "STRING"),
+        ],
+        "rejected_decisions": [
+            ("condition_id", "STRING"), ("source_wallet", "STRING"),
+            ("strategy", "STRING"), ("side", "STRING"), ("mode", "STRING"),
+            ("reject_reason", "STRING"), ("reject_detail", "STRING"),
+        ],
+        "polygon_stream_hits": [
+            ("wallet", "STRING"), ("pseudonym", "STRING"),
+            ("tx_hash", "STRING"), ("asset_id", "STRING"),
+        ],
+        "smart_wallet_rankings": [
+            ("wallet", "STRING"), ("pseudonym", "STRING"),
+            ("category", "STRING"),
+        ],
+    }
+    schema_hints = _TABLE_SCHEMAS.get(table)
+    if schema_hints:
+        # Mix: explicit for known string cols, autodetect everything else.
+        # Build SchemaField list only for cols actually present in df.
+        existing = set(df.columns)
+        explicit_schema = [
+            bigquery.SchemaField(name, ftype)
+            for name, ftype in schema_hints if name in existing
+        ]
+        job_config = bigquery.LoadJobConfig(
+            write_disposition="WRITE_TRUNCATE",
+            source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+            schema=explicit_schema,
+            autodetect=True,  # for non-explicit columns
+        )
+    else:
+        job_config = bigquery.LoadJobConfig(
+            write_disposition="WRITE_TRUNCATE",
+            autodetect=True,
+            source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+        )
     # Write to JSONL temp file (avoids pandas/pyarrow version issues).
     # Sanitize: NaN → None (pandas serializes NaN as bare `NaN` which
     # isn't valid JSON), strip control chars from string fields.

@@ -64,6 +64,18 @@ STALE_ENTRY_MAX_AGE_MIN = 15           # don't copy a smart-money entry that's
 # _runtime_overrides() — refreshed every 60s).
 DAILY_COPY_CAP = 200
 
+# ── Per-wallet concentration caps (added 2026-05-19) ─────────────────────
+# Live data over 87 trades (2026-05-09 → 2026-05-12) showed top 2 wallets
+# contributed +$193 of the $171 total PnL — the rest of the book was
+# net-negative. The strategy's apparent edge depended on a single lucky
+# copy ($23.55 trade → +$100). These caps prevent any single wallet from
+# making OR breaking the strategy:
+#   • At most N copies per UTC day from any one wallet
+#   • At most $X notional exposure per UTC day to any one wallet
+# Both overridable via runtime_config.json so the dashboard can tune.
+MAX_COPIES_PER_WALLET_PER_DAY = 3
+MAX_NOTIONAL_PER_WALLET_PER_DAY_USD = 50.0
+
 # Runtime overrides loaded from GCS so dashboard can tune without restart.
 # Cached for 60s in-process to bound GCS read load.
 _RUNTIME_CONFIG = {"data": {}, "fetched_at": 0.0}
@@ -99,6 +111,45 @@ def _effective_edge_min() -> float:
 
 def _effective_edge_max() -> float:
     return float(_runtime_overrides().get("edge_max_pct", 10.0)) / 100.0
+
+
+def _effective_max_copies_per_wallet() -> int:
+    return int(_runtime_overrides().get("max_copies_per_wallet_per_day",
+                                          MAX_COPIES_PER_WALLET_PER_DAY))
+
+
+def _effective_max_notional_per_wallet() -> float:
+    return float(_runtime_overrides().get("max_notional_per_wallet_per_day_usd",
+                                            MAX_NOTIONAL_PER_WALLET_PER_DAY_USD))
+
+
+def _todays_wallet_exposure(wallet: str) -> tuple:
+    """(count, total_size_usd) of TODAY's smart_copy fires from this wallet.
+
+    Looks at BOTH the new source_wallet column (post-2026-05-19 migration)
+    AND the legacy notes pattern (`0xWALLET[:12]`), so pre-migration rows
+    are still counted toward the cap during the transition window.
+    """
+    try:
+        from sqlalchemy.orm import Session
+        from sqlalchemy import text as _t
+        from data.storage import engine as _eng
+        # Use the 12-char prefix for both: source_wallet stores the full
+        # 42-char address; notes embed only `wallet[:12]`. LIKE-prefix on
+        # the column gives an indexed match without needing exact equality.
+        prefix = wallet[:12]
+        with Session(_eng) as s:
+            r = s.execute(_t("""
+                SELECT COUNT(*), COALESCE(SUM(size_usd), 0.0)
+                FROM decisions
+                WHERE ts >= datetime('now', 'start of day')
+                  AND size_usd > 0
+                  AND (source_wallet LIKE :w || '%'
+                       OR notes LIKE '%' || :w || '%')
+            """), {"w": prefix}).first()
+        return int(r[0] or 0), float(r[1] or 0.0)
+    except Exception:
+        return 0, 0.0
 
 
 def _todays_copy_count() -> int:
@@ -484,11 +535,19 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
     from sqlalchemy.orm import Session
     from sqlalchemy import update
     from datetime import datetime as _dt, timedelta as _td
-    from data.storage import engine, PolymarketMarket, PolymarketBookSnapshot, Decision
+    from data.storage import (
+        engine, PolymarketMarket, PolymarketBookSnapshot, Decision,
+        record_rejection, RejectReason,
+    )
     from execution.wallet import Wallet, record_paper_trade
     from risk.portfolio import PortfolioGuard
     from risk.position_sizer import size_trade
     from models.realized_vol import estimate_sigma_per_minute, latest_btc_price
+    from monitor.halt_flag import effective_mode as _eff_mode
+
+    # Snapshot current mode once per tick — used to tag every rejection
+    # so dashboard mode-divergence checks have correct attribution.
+    _mode_now = _eff_mode() or "paper"
 
     if not signals:
         return 0
@@ -511,6 +570,11 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
             if age_min > STALE_ENTRY_MAX_AGE_MIN:
                 logger.info(f"smart_money: SKIP (entry {age_min:.0f}m old > "
                              f"{STALE_ENTRY_MAX_AGE_MIN}m) {sig.market_title[:40]}")
+                record_rejection(mode=_mode_now, strategy="smart_copy",
+                                  condition_id=sig.condition_id,
+                                  source_wallet=sig.wallet,
+                                  reject_reason=RejectReason.STALE_SIGNAL,
+                                  reject_detail=f"{age_min:.0f}m > {STALE_ENTRY_MAX_AGE_MIN}m")
                 continue
 
         # 1. Do we know this market? If not, auto-add it so book_tick can
@@ -532,6 +596,11 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
                 untrackable += 1
                 logger.info(f"smart_money: SKIP (could not track market) "
                              f"{sig.wallet_name}: {sig.market_title[:50]}")
+                record_rejection(mode=_mode_now, strategy="smart_copy",
+                                  condition_id=sig.condition_id,
+                                  source_wallet=sig.wallet,
+                                  reject_reason=RejectReason.UNTRACKED_MARKET,
+                                  reject_detail=sig.market_title[:120])
                 continue
 
         # 2. Resolves too soon?
@@ -540,6 +609,11 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
         if mins_to_close < 2.0:
             logger.info(f"smart_money: SKIP (resolves in {mins_to_close:.1f}min) "
                          f"{sig.market_title[:50]}")
+            record_rejection(mode=_mode_now, strategy="smart_copy",
+                              condition_id=sig.condition_id,
+                              source_wallet=sig.wallet,
+                              reject_reason=RejectReason.RESOLVES_TOO_SOON,
+                              reject_detail=f"{mins_to_close:.1f}min")
             continue
 
         # 3. Latest book — fetch on-demand if we don't have a recent snapshot.
@@ -574,6 +648,10 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
                 continue
         if book is None or book.yes_bid is None or book.yes_ask is None:
             logger.info(f"smart_money: SKIP (no book after fetch) {sig.market_title[:50]}")
+            record_rejection(mode=_mode_now, strategy="smart_copy",
+                              condition_id=sig.condition_id,
+                              source_wallet=sig.wallet,
+                              reject_reason=RejectReason.NO_BOOK)
             continue
 
         yes_bid = float(book.yes_bid)
@@ -582,6 +660,11 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
         no_ask = float(book.no_ask) if book.no_ask is not None else (1.0 - yes_bid)
         if yes_ask + no_ask > 1.05:
             logger.info(f"smart_money: SKIP (placeholder book) {sig.market_title[:50]}")
+            record_rejection(mode=_mode_now, strategy="smart_copy",
+                              condition_id=sig.condition_id,
+                              source_wallet=sig.wallet,
+                              reject_reason=RejectReason.BOOK_PLACEHOLDER,
+                              reject_detail=f"sum={yes_ask+no_ask:.3f}")
             continue
 
         side = "YES" if sig.outcome.lower().startswith("y") else "NO"
@@ -600,6 +683,12 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
             if abs(our_ask - ref_price) > MAX_PRICE_DRIFT_FROM_SMART:
                 logger.info(f"smart_money: SKIP (price drift {ref_price:.3f}→"
                              f"{our_ask:.3f}) {sig.market_title[:40]}")
+                record_rejection(mode=_mode_now, strategy="smart_copy",
+                                  condition_id=sig.condition_id,
+                                  source_wallet=sig.wallet, side=side,
+                                  implied_yes_prob=yes_ask if side == "YES" else 1.0 - yes_bid,
+                                  reject_reason=RejectReason.PRICE_DRIFT,
+                                  reject_detail=f"{ref_price:.3f}->{our_ask:.3f}")
                 continue
         else:
             logger.info(f"smart_money: drift gate skipped (no ref price) "
@@ -607,6 +696,11 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
         # 5. Tail filter — refuse lottery tickets even when smart bets them
         if our_ask < 0.05 or our_ask > 0.95:
             logger.info(f"smart_money: SKIP (tail {our_ask:.2f}) {sig.market_title[:40]}")
+            record_rejection(mode=_mode_now, strategy="smart_copy",
+                              condition_id=sig.condition_id,
+                              source_wallet=sig.wallet, side=side,
+                              reject_reason=RejectReason.TAIL,
+                              reject_detail=f"paid={our_ask:.3f}")
             continue
 
         # 6. Idempotency — already have a position on this market?
@@ -617,12 +711,38 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
                                 Decision.resolution_yes.is_(None))
                         .first())
         if existing:
+            record_rejection(mode=_mode_now, strategy="smart_copy",
+                              condition_id=sig.condition_id,
+                              source_wallet=sig.wallet, side=side,
+                              reject_reason=RejectReason.DUPLICATE_POSITION)
+            continue
+
+        # ── Per-wallet concentration cap (count) ─────────────────────
+        # Block if this wallet has already used its daily count budget.
+        # Notional check happens AFTER sizing so we know the actual $.
+        wallet_count_today, wallet_notional_today = _todays_wallet_exposure(sig.wallet)
+        max_count = _effective_max_copies_per_wallet()
+        max_notional = _effective_max_notional_per_wallet()
+        if wallet_count_today >= max_count:
+            logger.info(f"smart_money: SKIP (wallet cap count "
+                         f"{wallet_count_today}/{max_count}) {sig.wallet[:12]} "
+                         f"{sig.market_title[:40]}")
+            record_rejection(mode=_mode_now, strategy="smart_copy",
+                              condition_id=sig.condition_id,
+                              source_wallet=sig.wallet, side=side,
+                              reject_reason=RejectReason.WALLET_CAP_COUNT,
+                              reject_detail=f"{wallet_count_today}/{max_count}")
             continue
 
         # 7. Portfolio gate
         can, reason = portfolio.can_open(sig.condition_id)
         if not can:
             logger.info(f"smart_money: portfolio block — {reason}")
+            record_rejection(mode=_mode_now, strategy="smart_copy",
+                              condition_id=sig.condition_id,
+                              source_wallet=sig.wallet, side=side,
+                              reject_reason=RejectReason.CONCURRENT,
+                              reject_detail=str(reason)[:120])
             continue
 
         # 8. Size via Kelly, using assumed win prob from smart's track record
@@ -633,6 +753,13 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
         if edge < _effective_edge_min():
             logger.info(f"smart_money: SKIP (edge {edge*100:+.1f}% < 4%) "
                          f"{sig.market_title[:40]}")
+            record_rejection(mode=_mode_now, strategy="smart_copy",
+                              condition_id=sig.condition_id,
+                              source_wallet=sig.wallet, side=side,
+                              model_yes_prob=model_yes_prob,
+                              implied_yes_prob=our_ask if side == "YES" else 1.0 - our_ask,
+                              reject_reason=RejectReason.EDGE_TOO_SMALL,
+                              reject_detail=f"edge={edge*100:+.2f}%")
             continue
 
         sizing = size_trade(
@@ -643,8 +770,30 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
             bankroll=wallet.available_balance(),
         )
         if sizing.size_usd < 1.0:
+            record_rejection(mode=_mode_now, strategy="smart_copy",
+                              condition_id=sig.condition_id,
+                              source_wallet=sig.wallet, side=side,
+                              intended_size_usd=float(sizing.size_usd),
+                              reject_reason=RejectReason.BANKROLL,
+                              reject_detail=f"size ${sizing.size_usd:.2f} < $1")
             continue
         final_size = round(sizing.size_usd, 2)
+
+        # ── Per-wallet concentration cap (notional) ─────────────────
+        # Clip-or-skip semantics: if the new trade would push us past the
+        # daily $ budget for this wallet, skip rather than partial-fill.
+        # Partial fills distort Kelly sizing and confuse calibration.
+        if wallet_notional_today + final_size > max_notional:
+            logger.info(f"smart_money: SKIP (wallet notional "
+                         f"${wallet_notional_today:.0f}+${final_size:.0f} > "
+                         f"${max_notional:.0f}) {sig.wallet[:12]}")
+            record_rejection(mode=_mode_now, strategy="smart_copy",
+                              condition_id=sig.condition_id,
+                              source_wallet=sig.wallet, side=side,
+                              intended_size_usd=final_size,
+                              reject_reason=RejectReason.WALLET_CAP_NOTIONAL,
+                              reject_detail=f"${wallet_notional_today:.0f}+${final_size:.0f}>${max_notional:.0f}")
+            continue
 
         # ── Quality gate: score + adaptive threshold + daily cap ──
         implied = yes_ask if side == "YES" else (1 - yes_bid)
@@ -673,16 +822,31 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
                 globals()["_CAP_ALERTED_DATE"] = today_str
             logger.info(f"smart_money: SKIP (daily cap {eff_cap} reached) "
                          f"{sig.market_title[:40]}")
+            record_rejection(mode=_mode_now, strategy="smart_copy",
+                              condition_id=sig.condition_id,
+                              source_wallet=sig.wallet, side=side,
+                              reject_reason=RejectReason.DAILY_CAP,
+                              reject_detail=f"{today_count}/{eff_cap}")
             continue
         if score < min_score:
             logger.info(f"smart_money: SKIP (score {score:.0f} < threshold "
                          f"{min_score:.0f}, today={today_count}/{eff_cap}) "
                          f"{sig.market_title[:40]}")
+            record_rejection(mode=_mode_now, strategy="smart_copy",
+                              condition_id=sig.condition_id,
+                              source_wallet=sig.wallet, side=side,
+                              reject_reason=RejectReason.QUALITY_SCORE,
+                              reject_detail=f"score={score:.0f}<{min_score:.0f}")
             continue
         # Edge upper cap from runtime overrides
         if abs(edge) > _effective_edge_max():
             logger.info(f"smart_money: SKIP (edge {edge*100:+.1f}% > max "
                          f"{_effective_edge_max()*100:.1f}%) {sig.market_title[:40]}")
+            record_rejection(mode=_mode_now, strategy="smart_copy",
+                              condition_id=sig.condition_id,
+                              source_wallet=sig.wallet, side=side,
+                              reject_reason=RejectReason.EDGE_TOO_LARGE,
+                              reject_detail=f"edge={edge*100:+.2f}%")
             continue
 
         # ── Claude final gate (last call before fire) ──
@@ -708,6 +872,12 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
         if verdict.get("decision") == "REJECT":
             logger.info(f"smart_money: SKIP (claude REJECT — "
                          f"{verdict.get('reason','')[:80]}) {sig.market_title[:40]}")
+            record_rejection(mode=_mode_now, strategy="smart_copy",
+                              condition_id=sig.condition_id,
+                              source_wallet=sig.wallet, side=side,
+                              intended_size_usd=final_size,
+                              reject_reason=RejectReason.CLAUDE_REJECT,
+                              reject_detail=str(verdict.get("reason", ""))[:200])
             continue
 
         # 9. Fire trade — paper math vs real on-chain via place_market_order
@@ -806,7 +976,13 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
         try:
             with Session(engine) as session:
                 session.execute(
-                    update(Decision).where(Decision.id == decision_id).values(notes=tag)
+                    update(Decision).where(Decision.id == decision_id).values(
+                        notes=tag,
+                        strategy="smart_copy",
+                        source_wallet=sig.wallet,
+                        decision_outcome="held_to_expiry",  # exit_manager updates if it intervenes
+                        edge_definition="smart_copy_follow",
+                    )
                 )
                 session.commit()
         except Exception as e:

@@ -496,6 +496,17 @@ def main():
         f"{cap_line}\n"
         f"Phase 1: data feeds (BTC ticks + Polymarket books)"
     )
+    # Observability + caps active as of 2026-05-19. v2_meanrev is firing
+    # to validate the 2026-05-17 execution-cost fix (predicted WR 31% → 45-55%).
+    # If post-resume rigor check shows WR still <45% at n≥50, halt v2.
+    notifier.send(
+        "🔁 <b>poly-trader RESUME — observability + caps active</b>\n"
+        "Validating 2026-05-17 execution-cost fix on v2_meanrev "
+        "(predicted WR 31% → 45-55%).\n"
+        "✅ smart_money per-wallet caps: 3 copies / $50 notional / day\n"
+        "✅ rejected_decisions logged for every blocked attempt\n"
+        "📊 Calibration tab on dashboard auto-flags anti-predictive buckets"
+    )
 
     try:
         # Block forever — scheduler is on background thread, WS is on its own

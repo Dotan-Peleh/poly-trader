@@ -108,6 +108,13 @@ class Decision(Base):
     pnl_usd = Column(Float)
     resolved_at = Column(DateTime)
     notes = Column(Text)
+    # Observability columns added 2026-05-19. Pulled out of `notes` so
+    # queries don't need regex. Backfilled by
+    # scripts/backfill_decision_columns.py for historical rows.
+    strategy = Column(String(16), index=True)                        # 'v2_meanrev' | 'smart_copy'
+    source_wallet = Column(String(64), index=True)                   # '0x...' for smart_copy; NULL for v2
+    decision_outcome = Column(String(32), index=True)                # see DecisionOutcome strings below
+    edge_definition = Column(String(32))                             # 'model_minus_implied' | 'smart_copy_follow'
 
 
 class ClaudeDecision(Base):
@@ -129,8 +136,93 @@ class ClaudeDecision(Base):
     closed_at = Column(DateTime)
 
 
+class RejectedDecision(Base):
+    """Every fire attempt that was BLOCKED by a gate.
+
+    Added 2026-05-19 after the v2_meanrev autopsy revealed we had no
+    way to attribute volume gaps to specific gates — `decisions` only
+    logs fills. With this table, "why didn't mode X fire" becomes one
+    query against reject_reason."""
+    __tablename__ = "rejected_decisions"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ts = Column(DateTime, index=True, default=datetime.utcnow)
+    mode = Column(String(8), index=True)                             # 'paper' | 'live'
+    strategy = Column(String(16), index=True)                        # 'v2_meanrev' | 'smart_copy'
+    condition_id = Column(String(80), index=True)
+    source_wallet = Column(String(64), index=True)                   # NULL for v2_meanrev
+    side = Column(String(8))                                          # 'YES' | 'NO' | NULL
+    intended_size_usd = Column(Float)
+    model_yes_prob = Column(Float)
+    implied_yes_prob = Column(Float)
+    reject_reason = Column(String(48), index=True)                   # see RejectReason below
+    reject_detail = Column(Text)                                      # free-form ("$23.5+$30 > $50")
+
+
+class RejectReason:
+    """String constants for RejectedDecision.reject_reason."""
+    BAND = "blocked_band"                          # implied outside [0.40, 0.60]
+    EDGE_TOO_SMALL = "blocked_edge_too_small"
+    EDGE_TOO_LARGE = "blocked_edge_too_large"
+    TAIL = "blocked_tail"                          # paid outside [0.10, 0.90]
+    BOOK_PLACEHOLDER = "blocked_book_placeholder"  # yes_ask+no_ask > 1.05
+    COOLDOWN = "blocked_cooldown"
+    DAILY_LOSS = "blocked_daily_loss"
+    CONCURRENT = "blocked_concurrent"
+    BANKROLL = "blocked_bankroll"
+    HALT_FLAG = "blocked_halt_flag"
+    WALLET_CAP_COUNT = "blocked_wallet_cap_count"
+    WALLET_CAP_NOTIONAL = "blocked_wallet_cap_notional"
+    STALE_SIGNAL = "blocked_stale_signal"
+    PRICE_DRIFT = "blocked_price_drift"
+    UNTRACKED_MARKET = "blocked_untracked_market"
+    NO_BOOK = "blocked_no_book"
+    RESOLVES_TOO_SOON = "blocked_resolves_too_soon"
+    QUALITY_SCORE = "blocked_quality_score"
+    DAILY_CAP = "blocked_daily_cap"
+    CLAUDE_REJECT = "blocked_claude_reject"
+    DUPLICATE_POSITION = "blocked_duplicate_position"
+
+
 def init_db():
     Base.metadata.create_all(engine)
+    # SQLite ALTER TABLE for in-place upgrade from pre-2026-05-19 schemas.
+    # create_all() only creates missing TABLES, not missing COLUMNS, so
+    # an existing decisions table on the running bot needs explicit ALTERs.
+    if _is_sqlite:
+        with engine.connect() as conn:
+            existing = {r[1] for r in conn.exec_driver_sql("PRAGMA table_info(decisions)")}
+            for col, ddl in [
+                ("strategy",         "ALTER TABLE decisions ADD COLUMN strategy VARCHAR(16)"),
+                ("source_wallet",    "ALTER TABLE decisions ADD COLUMN source_wallet VARCHAR(64)"),
+                ("decision_outcome", "ALTER TABLE decisions ADD COLUMN decision_outcome VARCHAR(32)"),
+                ("edge_definition",  "ALTER TABLE decisions ADD COLUMN edge_definition VARCHAR(32)"),
+            ]:
+                if col not in existing:
+                    conn.exec_driver_sql(ddl)
+            conn.commit()
+
+
+def record_rejection(*, mode: str, strategy: str, condition_id: str,
+                     reject_reason: str, source_wallet: str = None,
+                     side: str = None, intended_size_usd: float = None,
+                     model_yes_prob: float = None, implied_yes_prob: float = None,
+                     reject_detail: str = None) -> None:
+    """Log a blocked fire attempt. Non-throwing — observability must NOT
+    break the hot path. If the DB write fails (lock, schema mismatch),
+    we swallow silently rather than block trading."""
+    try:
+        with Session(engine) as session:
+            session.add(RejectedDecision(
+                mode=mode, strategy=strategy, condition_id=condition_id,
+                source_wallet=source_wallet, side=side,
+                intended_size_usd=intended_size_usd,
+                model_yes_prob=model_yes_prob,
+                implied_yes_prob=implied_yes_prob,
+                reject_reason=reject_reason, reject_detail=reject_detail,
+            ))
+            session.commit()
+    except Exception:
+        pass
 
 
 # ── Common write helpers ────────────────────────────────────────────────────

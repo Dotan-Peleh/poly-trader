@@ -32,7 +32,8 @@ logger = logging.getLogger(__name__)
 
 PROJECT = "crypto-agent-494710"
 DATASET = "poly_trader_analytics"
-TABLES = ["decisions", "polygon_stream_hits", "smart_wallet_rankings"]
+TABLES = ["decisions", "polygon_stream_hits", "smart_wallet_rankings",
+          "rejected_decisions"]
 
 
 def _ensure_dataset(client):

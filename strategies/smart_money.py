@@ -891,9 +891,8 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
         if is_live:
             # Cap to real on-chain pUSD with a 5% buffer for fee+slip
             try:
-                from data.polymarket_wallet import _fetch_balance
-                real_bal = _fetch_balance() or {}
-                real_avail = float(real_bal.get("effective") or 0.0)
+                from execution.polymarket_orders import live_collateral_usd
+                real_avail = live_collateral_usd()
             except Exception as e:
                 logger.warning(f"smart_money: live balance fetch failed: {e}; "
                                 "refusing live order")

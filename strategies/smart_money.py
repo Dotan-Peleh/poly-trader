@@ -891,9 +891,8 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
         if is_live:
             # Cap to real on-chain pUSD with a 5% buffer for fee+slip
             try:
-                from data.polymarket_wallet import _fetch_balance
-                real_bal = _fetch_balance() or {}
-                real_avail = float(real_bal.get("effective") or 0.0)
+                from execution.polymarket_orders import live_collateral_usd
+                real_avail = live_collateral_usd()
             except Exception as e:
                 logger.warning(f"smart_money: live balance fetch failed: {e}; "
                                 "refusing live order")
@@ -997,8 +996,11 @@ def execute_copy_trades(signals: list, notifier=None) -> int:
             # Tag from the decision row's actual mode (real fill = live;
             # paper = paper). Avoids the prior phantom-WIN class of bug.
             _mt = "LIVE" if mode_row == "live" else "PAPER"
+            _hdr = (f"💰 <b>LIVE BUY</b> 💰  {sig.wallet_name}"
+                    if mode_row == "live"
+                    else f"🐳➡️🤖 <b>[PAPER] COPIED {sig.wallet_name}</b>")
             notifier.send(
-                f"🐳➡️🤖 <b>[{_mt}] COPIED {sig.wallet_name}</b>\n"
+                f"{_hdr}\n"
                 f"📊 {sig.market_title[:55]}\n"
                 f"➡️ {side} @ ${fill_price:.3f} | size=${fill_size:.2f}\n"
                 f"💰 their position: {sig.new_size:.0f} contracts\n"
@@ -1131,16 +1133,20 @@ def execute_copy_exits(exit_signals: list, notifier=None) -> int:
         if notifier:
             pnl = result.get("pnl_usd", 0)
             icon = "✅" if pnl > 0 else "🔴"
-            from strategies.cumulative import today_cumulative_line
+            from strategies.cumulative import today_cumulative_line, live_lifetime_line
             cum = today_cumulative_line()
+            ltv = live_lifetime_line()
             _mt = "LIVE" if row_is_live else "PAPER"
+            _hdr = (f"💰 <b>LIVE SELL</b> 💰  {sig.wallet_name} (smart exit)"
+                    if row_is_live
+                    else f"🐳⬅️🤖 <b>[PAPER] SMART EXIT — CLOSED COPY</b>")
             notifier.send(
-                f"🐳⬅️🤖 <b>[{_mt}] SMART EXIT — CLOSED COPY</b>\n"
+                f"{_hdr}\n"
                 f"👤 {sig.wallet_name} reduced {sig.prev_size:.0f}→{sig.new_size:.0f} "
                 f"(-{sig.reduction_pct*100:.0f}%)\n"
                 f"📊 {sig.market_title[:55]}\n"
                 f"{icon} our P&amp;L: <b>${pnl:+.2f}</b>\n"
-                f"{cum}"
+                f"{cum}\n{ltv}"
             )
 
     return closed

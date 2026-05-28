@@ -331,14 +331,18 @@ def evaluate_open_positions(notifier=None) -> int:
                     icon = "🎯" if result["pnl_usd"] > 0 else "🔴"
                     tag = "WIN" if result["pnl_usd"] > 0 else "LOSS"
                     mode_label = "LIVE" if row_is_live else "PAPER"
-                    from strategies.cumulative import today_cumulative_line
+                    from strategies.cumulative import today_cumulative_line, live_lifetime_line
                     cum = today_cumulative_line()
+                    ltv = live_lifetime_line()
+                    _hdr = (f"💰 <b>LIVE SELL</b> 💰 — {tag}  <code>{d.condition_id[:20]}…</code>"
+                            if row_is_live
+                            else f"{icon} <b>[PAPER] EARLY {tag}</b> <code>{d.condition_id[:20]}…</code>")
                     notifier.send(
-                        f"{icon} <b>[{mode_label}] EARLY {tag}</b> <code>{d.condition_id[:20]}…</code>\n"
+                        f"{_hdr}\n"
                         f"📊 {d.side} @ {cost*100:.0f}¢ → exit @ {cur_per_share*100:.0f}¢\n"
                         f"💸 P&amp;L: <b>${result['pnl_usd']:+.4f}</b>\n"
                         f"💡 reason: {exit_reason}\n"
-                        f"{cum}"
+                        f"{cum}\n{ltv}"
                     )
                 closed += 1
             except Exception as e:

@@ -67,3 +67,41 @@ def today_cumulative_line() -> str:
     except Exception as e:
         logger.warning(f"today_cumulative_line failed: {e}")
         return ""
+
+
+# Live trading went live at this UTC moment — the LTV/lifetime counter
+# starts here so the user sees both "today's P&L" and "running total since
+# we put real money on the line".
+_LIVE_START_UTC = datetime(2026, 5, 28, 0, 0, 0)
+
+
+def live_lifetime_line() -> str:
+    """One-line lifetime P&L for LIVE trades only, since the live flip.
+
+    Returns an HTML-formatted string for Telegram, or an empty string on
+    failure (so callers can append unconditionally).
+    """
+    try:
+        with Session(engine) as session:
+            rows = (
+                session.query(Decision.pnl_usd)
+                .filter(Decision.resolved_at >= _LIVE_START_UTC,
+                         Decision.mode == "live",
+                         Decision.pnl_usd.isnot(None))
+                .all()
+            )
+        if not rows:
+            return "💎 Live LTV: <b>$+0.00</b> (0W/0L · since flip)"
+        pnls = [float(r[0]) for r in rows]
+        total = sum(pnls)
+        wins = sum(1 for p in pnls if p > 0)
+        losses = sum(1 for p in pnls if p <= 0)
+        n = wins + losses
+        wr = (wins / n * 100.0) if n else 0.0
+        return (
+            f"💎 Live LTV: <b>${total:+,.2f}</b> "
+            f"({wins}W/{losses}L · {wr:.0f}% WR · since flip)"
+        )
+    except Exception as e:
+        logger.warning(f"live_lifetime_line failed: {e}")
+        return ""

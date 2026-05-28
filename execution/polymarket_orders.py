@@ -319,3 +319,26 @@ def live_readiness_check() -> tuple[bool, list[str]]:
     if not _derive_deposit_wallet():
         missing.append("deposit-wallet derivation failed")
     return (len(missing) == 0, missing)
+
+
+def live_collateral_usd() -> float:
+    """Tradeable USDC collateral the CLOB actually recognizes for our funder,
+    via get_balance_allowance(COLLATERAL).
+
+    This is the authoritative "what can we trade" number. The raw on-chain
+    balanceOf of the deposit wallet reads $0 because Polymarket holds the
+    collateral in its own ledger, not as a raw ERC-20 on the deposit wallet
+    — so the prior _fetch_balance().effective gate wrongly saw $0 and skipped
+    every live order despite a funded account.
+    """
+    try:
+        from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+        client = _get_client()
+        resp = client.get_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        ) or {}
+        bal = resp.get("balance")
+        return float(bal) / 1_000_000.0 if bal is not None else 0.0
+    except Exception as e:
+        logger.error(f"live_collateral_usd failed: {e}")
+        return 0.0
